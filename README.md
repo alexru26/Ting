@@ -1,6 +1,6 @@
 # Python Mahjong Agent
 
-This folder contains the Python agent, the local simulator, and the Botzone entry point for Chinese Standard Mahjong.
+This folder contains the Python agent, for Chinese Standard Mahjong.
 
 ## Structure
 
@@ -8,7 +8,7 @@ This folder contains the Python agent, the local simulator, and the Botzone entr
 - `tiles.py` - tile utilities
 - `scoring.py` - hand evaluation and fan calculator bridge
 - `policy.py` - action selection heuristics used by the simulator and bot
-- `bot.py` - Botzone-compatible interface entry point
+- `bot.py` - main entry point
 - `local_game.py` - local round simulator and terminal board view
 - `main.py` - minimal runner that starts the bot entry point
 - `tests/` - unit tests for state, policy, and local game output
@@ -22,7 +22,7 @@ The default mode remains deterministic from the current game state, while neural
 
 The entrypoint is `__main__.py` -> `bot.py`.
 
-For each turn, Botzone provides:
+For each turn, inputs:
 
 - `requests`: full request history
 - `responses`: this bot's past responses
@@ -95,7 +95,7 @@ where `DEFENSE_WEIGHT` is currently `0.4`.
 
 Danger increases for tiles that look live and potentially useful to opponents, and decreases if an opponent already discarded that tile (safer signal).
 
-### 5. Botzone action safety guard
+### 5. Safety guard
 
 `bot.py` includes an action legality guard before sending output:
 
@@ -108,13 +108,9 @@ If policy output is invalid for the current reconstructed state, the bot falls b
 - `PLAY <first tile>` on draw
 - `PASS` otherwise
 
-This is designed to prevent Botzone `invalid action` failures.
-
 ### 6. Fan evaluation dependency
 
-Winning checks use `MahjongFanCalculator` when available. If unavailable locally, wrapper functions return conservative defaults.
-
-On Botzone, the runtime provides the fan calculator library.
+Winning checks use `MahjongFanCalculator` from `MahjongGB` when available. If unavailable locally, wrapper functions return conservative defaults.
 
 ### 7. Current limitations
 
@@ -227,25 +223,3 @@ set TING_POLICY_MODEL_PATH=data/model.json
 `TING_POLICY_MODEL_PATH` may point to either checkpoint format (`frequency_lookup_v1` or `count_policy_value_v1`).
 
 `NeuralPolicy` still keeps strict legality masking and falls back to rule policy on any load/inference issue.
-
-## Botzone submission
-
-Use the root-level `__main__.py` as the Botzone entry module. Botzone is launching the upload with `python -m`, so it must find `__main__.py` at the archive root.
-
-1. Make sure `bot.py` runs without local-only files such as `local_game.py`.
-2. Keep the Python modules that `bot.py` imports in the same upload bundle, including `state.py`, `tiles.py`, `policy.py`, and `scoring.py`.
-3. Do not include the compiled local test extension in the submission bundle; Botzone already provides the Mahjong fan calculator runtime.
-4. Zip the folder contents, not the parent folder. The archive root must contain `__main__.py`, `bot.py`, `policy.py`, `scoring.py`, `state.py`, and `tiles.py` directly.
-5. If Botzone says it cannot find `__main__`, the zip layout is wrong. Recreate the zip and inspect it before uploading.
-6. Test with a few local games first so you know the bot prints valid JSON responses when driven through the Botzone protocol.
-
-## Useful entry points
-
-- `python local_game.py --games 1 --tui` for a visual CLI replay
-- `python -m unittest` for the local tests
-- `python __main__.py` or `python -m python_agent` for the Botzone-style entry path
-- `python bot.py` for the underlying stdin/stdout entry point
-
-## Next steps
-
-1. Improve the discard policy with stronger goal selection and opponent modeling.
