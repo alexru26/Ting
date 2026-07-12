@@ -1,225 +1,135 @@
-# Python Mahjong Agent
+# Ting Mahjong Agent
 
-This folder contains the Python agent, for Chinese Standard Mahjong.
+Ting is a Chinese Standard Mahjong bot with a neural-first runtime and a deterministic rule-based fallback. The codebase is organized so the Botzone entry point stays safe and lightweight, while training, evaluation, and governance live in separate modules.
 
-## Structure
+## Architecture
 
-- `state.py` - game state tracking
-- `tiles.py` - tile utilities
-- `scoring.py` - hand evaluation and fan calculator bridge
-- `policy.py` - action selection heuristics used by the simulator and bot
-- `bot.py` - main entry point
-- `local_game.py` - local round simulator and terminal board view
-- `main.py` - minimal runner that starts the bot entry point
-- `tests/` - unit tests for state, policy, and local game output
+The runtime path starts in [src/__main__.py](src/__main__.py), which hands control to [src/bot.py](src/bot.py). The bot reconstructs the full game state from the Botzone request/response history using [src/state.py](src/state.py), then selects a policy through [src/policy.py](src/policy.py).
 
-## How the AI works
+The AI has three layers:
 
-This agent is a hybrid Mahjong policy with a deterministic, rule-based baseline and optional learned inference.
-The default mode remains deterministic from the current game state, while neural mode can load offline-trained checkpoints.
+- State and legality layer: [src/state.py](src/state.py) and [src/bot.py](src/bot.py) rebuild the position, enumerate legal actions, and enforce a final legality firewall before any response is emitted.
+- Decision layer: [src/policy.py](src/policy.py) contains the default goal-based Mahjong policy, the neural policy wrapper, the PPO rollout policy used by self-play, and the bounded search planner hook.
+- Model and governance layer: [src/imitation.py](src/imitation.py), [src/rl_self_play.py](src/rl_self_play.py), and [src/model_governance.py](src/model_governance.py) handle training, evaluation, promotion gating, registry metadata, and duplicate-wall comparisons.
 
-### 1. Input and state reconstruction
+### Runtime decision flow
 
-The entrypoint is `__main__.py` -> `bot.py`.
+At inference time the bot follows this sequence:
 
-For each turn, inputs:
+1. Reconstruct the current state from the full history.
+2. Use the neural policy by default and auto-discover the bundled model artifact under `src/`.
+3. Ask the selected policy for an action.
+4. Verify the action against the current request context.
+5. Fall back to a safe rule-based move if the model output is invalid or unavailable.
 
-- `requests`: full request history
-- `responses`: this bot's past responses
+Neural inference is the default path. The legacy rule policy remains as a strict safety fallback whenever model loading fails, inference fails, uncertainty handling requests fallback, or the emitted action is not legal. Search-time augmentation is optional and budgeted so the Botzone runtime remains safe.
 
-`GameState.from_history(...)` in `state.py` replays the whole sequence into a structured state:
+### Policy components
 
-- my hand, melds, discards, flowers
-- opponent discards and exposed melds
-- seen tile counts
-- current request context (`type`, actor, action, relevant tile)
+- [src/policy.py](src/policy.py): the main rule-based Mahjong policy, including discard scoring, kong/peng/chi decisions, neural fallback, uncertainty handling, and search-time hooks.
+- [src/model.py](src/model.py): the PyTorch CNN policy-value model used for learned inference.
+- [src/search_planner.py](src/search_planner.py): bounded rollout planning over candidate actions with a hard runtime budget.
+- [src/model_governance.py](src/model_governance.py): duplicate-wall paired evaluation, Elo ladder helpers, SPRT-style promotion gating, and model registry records.
 
-This lets the policy reason from a full reconstructed position instead of only the latest request.
+## Training And Evaluation
 
-### 2. Goal selection (offense model)
+Training is split into stages so the runtime bot never depends on training-only code.
 
-The policy evaluates several hand goals from `scoring.py`:
+### 1. Data generation
 
-- `STANDARD`
-- `SEVEN_PAIRS`
-- `PURE_FLUSH`
-- `MIXED_FLUSH`
-- `ALL_TRIPLETS`
+[src/local_game.py](src/local_game.py) runs local Mahjong games and can export JSONL trajectories for supervised or RL training. Each record contains the request context, legal actions, chosen action, reward placeholder, and deterministic feature vector.
 
-Each goal has:
+Example:
 
-- an estimated base fan value
-- a goal-specific shanten estimate
-- utility:
+```bash
+python src/local_game.py --games 200 --seed 42 --export-dataset data/train.jsonl
+```
 
-`utility = base_fan / (shanten + 1)^1.5`
+### 2. Supervised pretraining
 
-The highest utility goal is selected for the current hand.
+[src/imitation.py](src/imitation.py) is now neural-only and supports the CNN checkpoint family backed by PyTorch.
 
-### 3. Turn decision flow
+A checkpoint family is the storage/behavior contract for a model artifact: how it is serialized, what heads/statistics it contains, and which inference code path can load it. The repository now keeps only one active family for deployment and training: CNN policy-value checkpoints.
 
-The policy in `policy.py` routes decisions by request type.
+Example commands:
 
-#### On draw (`type 2`)
+```bash
+python src/imitation.py train-cnn --dataset data/train.jsonl
+```
 
-1. Check self-draw win (`HU`) via fan calculator wrapper (`can_win`)
-2. Check concealed kong (`GANG tile`)
-3. Check supplement kong (`BUGANG tile`)
-4. Otherwise choose discard based on goal + defense
+The CNN is the deployable deep model path. Relative output paths are normalized under `src/` so the model is easy to package with the bot.
 
-#### On opponent discard (`type 3 PLAY`)
+### 3. Reinforcement learning and self-play
 
-1. Check win on discard (`HU`)
-2. Check open kong (`GANG`)
-3. Check `PENG discard_tile` followed by best discard if beneficial
-4. Check `CHI mid discard` only if discard came from left player and improves hand
-5. Else `PASS`
+[src/rl_self_play.py](src/rl_self_play.py) implements the self-play worker, reward shaping, PPO fine-tuning, baseline evaluation, and the duplicate-wall evaluation mode.
 
-#### On gang event (`type 3 GANG/BUGANG`)
+Example commands:
 
-- Only attempt robbing the kong (`HU`) on `BUGANG`
-- Otherwise `PASS`
+```bash
+python src/rl_self_play.py self-play --games 100 --seed 42
+python src/rl_self_play.py ppo-train --model src/model.h5 --games 32 --eval-games 16
+python src/rl_self_play.py ppo-eval --model src/model.h5 --games 16
+python src/rl_self_play.py duplicate-wall --model src/model.h5 --games 16
+```
 
-### 4. Discard scoring (offense + defense)
+### 4. Governance and promotion
 
-When discarding, the policy computes:
+The current evaluation layer focuses on reproducibility and low-variance comparisons:
 
-- offense term: lower shanten after discard is better
-- defense term: danger score for the tile against opponent exposed information
+- duplicate-wall paired evaluation to reduce randomness
+- Elo ladder helpers for relative checkpoint tracking
+- SPRT-like promotion gate logic for candidate acceptance
+- model registry entries with version, checksum, training corpus, and metrics
+- regression coverage for legality, deterministic replay, and fallback consistency
 
-Combined score:
+In this repository, governance means model lifecycle controls that make evaluation and deployment reproducible and auditable (registry metadata, checksums, deterministic paired evaluation, and regression safeguards). Promotion means deciding whether a candidate checkpoint replaces the current baseline, based on measured performance gates instead of manual intuition.
 
-`score = offense - DEFENSE_WEIGHT * danger`
+## Model Files
 
-where `DEFENSE_WEIGHT` is currently `0.4`.
+The repository keeps deployable model artifacts inside `src/` so Botzone packaging stays simple. The default CNN artifact path is [src/model.h5](src/model.h5).
 
-Danger increases for tiles that look live and potentially useful to opponents, and decreases if an opponent already discarded that tile (safer signal).
+The model loader supports CNN checkpoints (HDF5) for neural policy runtime.
 
-### 5. Safety guard
+## Environment And Runtime Flags
 
-`bot.py` includes an action legality guard before sending output:
+The bot does not require environment variables on Botzone. By default it runs neural-first and attempts to load the bundled model artifact from `src/model.h5`.
 
-- validates action format against current request type
-- checks tile possession for `PLAY`, `PENG`, `CHI`, `GANG`, `BUGANG`
-- verifies left-player restriction for `CHI`
+Environment variables are optional local overrides:
 
-If policy output is invalid for the current reconstructed state, the bot falls back to a safe action:
+- `TING_POLICY_MODE`: `rule`, `neural`, or another supported policy mode
+- `TING_POLICY_MODEL_PATH`: path to the checkpoint to load
+- `TING_POLICY_RISK_MODE`: adaptation mode used by the neural policy wrapper
+- `TING_POLICY_TEMPERATURE`: sampling temperature for neural action selection
+- `TING_POLICY_ENABLE_SEARCH`: enables bounded search-time planning
+- `TING_POLICY_SEARCH_DISABLE`: hard disables search planning
+- `TING_POLICY_BELIEF_WEIGHT`: weight for the belief-related features in the neural stack
 
-- `PLAY <first tile>` on draw
-- `PASS` otherwise
+The bot always keeps the legality firewall in [src/bot.py](src/bot.py), so a bad model output does not break protocol correctness.
 
-### 6. Fan evaluation dependency
+## Repository Layout
 
-Winning checks use `MahjongFanCalculator` from `MahjongGB` when available. If unavailable locally, wrapper functions return conservative defaults.
+- [src/state.py](src/state.py) - request replay and game-state reconstruction
+- [src/bot.py](src/bot.py) - Botzone I/O adapter and legality firewall
+- [src/policy.py](src/policy.py) - rule-based policy, neural wrapper, and search hooks
+- [src/features.py](src/features.py) - deterministic feature extraction
+- [src/action_codec.py](src/action_codec.py) - action vocabulary and encode/decode helpers
+- [src/dataset.py](src/dataset.py) - JSONL trajectory schema, reader, and writer
+- [src/local_game.py](src/local_game.py) - local simulator and dataset export
+- [src/imitation.py](src/imitation.py) - supervised training and offline evaluation
+- [src/rl_self_play.py](src/rl_self_play.py) - PPO/self-play and candidate evaluation
+- [src/model_governance.py](src/model_governance.py) - registry metadata, Elo, and promotion gating
+- [tests/](tests/) - unit and integration coverage for the runtime, training, and governance layers
 
-### 7. Current limitations
-
-- No probabilistic hidden-hand inference yet
-- No long-horizon search (MCTS/expectimax) yet
-- Current learned model is count-based imitation/policy-value, not a deep network
-- Defensive model is lightweight and based on exposed public information only
-
-## Local testing
+## Local Testing
 
 Run a single game and print the final state:
 
 ```bash
-python local_game.py --games 1 --seed 42
+python src/local_game.py --games 1 --seed 42
 ```
 
-Run a single game with the simple terminal board view:
+Run the full test suite:
 
 ```bash
-python local_game.py --games 1 --seed 42 --tui --tui-delay 0 --no-clear
+python -m unittest -q
 ```
-
-Run multiple games for a quick batch summary:
-
-```bash
-python local_game.py --games 100
-```
-
-## Dataset export for ML
-
-The local simulator can export per-decision trajectories to JSONL for training and analysis.
-
-Export one game:
-
-```bash
-python local_game.py --games 1 --seed 42 --export-dataset data/train.jsonl
-```
-
-Export a larger deterministic batch:
-
-```bash
-python local_game.py --games 200 --seed 42 --export-dataset data/train.jsonl
-```
-
-Each line is one decision record with this top-level shape:
-
-```json
-{
-	"game_id": "game-0",
-	"turn_index": 0,
-	"player_id": 0,
-	"request_type": 2,
-	"request_action": "DRAW",
-	"action": "PLAY W1",
-	"legal_actions": ["PASS", "HU", "PLAY W1"],
-	"reward": 0.0,
-	"done": false,
-	"features": {
-		"hand_counts": [0, 0],
-		"seen_counts": [0, 0],
-		"self_discard_counts": [0, 0],
-		"pack_counts": [0, 0],
-		"opponent_discard_counts": [[0, 0], [0, 0], [0, 0]],
-		"meta": [0, 0, 0, 0, 2, 0, 1, 0]
-	},
-	"metadata": {}
-}
-```
-
-Notes:
-
-- `legal_actions` is generated from the same legality model used by runtime checks.
-- `features` are deterministic and tile-order stable, suitable for reproducible training runs.
-- `meta` encodes context fields in fixed order: my_id, quan, flowers, n_packs, request_type, last_actor, last_action_id, last_tile_idx.
-- `reward` and `done` are currently placeholders for later RL phases.
-
-### Supervised imitation training
-
-Train a frequency-based imitation checkpoint from exported trajectories:
-
-```bash
-python src/imitation.py train --dataset data/train.jsonl --out data/model.json
-```
-
-Train a count-based policy-value checkpoint with multi-head action statistics and value estimation:
-
-```bash
-python src/imitation.py train-pv --dataset data/train.jsonl --out data/model_pv.json
-```
-
-Evaluate offline masked top-k metrics and calibration (ECE):
-
-```bash
-python src/imitation.py eval --dataset data/train.jsonl --model data/model.json --topk 1,3,5
-```
-
-Evaluate policy-value checkpoints with masked cross-entropy and value MSE:
-
-```bash
-python src/imitation.py eval-pv --dataset data/train.jsonl --model data/model_pv.json --topk 1,3,5
-```
-
-Use the trained checkpoint at inference time:
-
-```bash
-set TING_POLICY_MODE=neural
-set TING_POLICY_MODEL_PATH=data/model.json
-```
-
-`TING_POLICY_MODEL_PATH` may point to either checkpoint format (`frequency_lookup_v1` or `count_policy_value_v1`).
-
-`NeuralPolicy` still keeps strict legality masking and falls back to rule policy on any load/inference issue.
