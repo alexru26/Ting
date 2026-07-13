@@ -2,8 +2,10 @@ import json
 import os
 import sys
 from typing import Any, Dict, List
+
 from state import GameState
 from policy import create_policy
+from tiles import ALL_TILES, tile_value
 
 class MahjongBot:
     """
@@ -20,7 +22,10 @@ class MahjongBot:
         responses = payload.get('responses', [])
         if not requests:
             return 'PASS'
-        state = GameState.from_history(requests, responses)
+        try:
+            state = GameState.from_history(requests, responses)
+        except Exception:
+            return 'PASS'
         if state.last_request_type in (-1, 0, 1):
             return 'PASS'
         policy_mode = os.getenv('TING_POLICY_MODE')
@@ -68,14 +73,20 @@ class MahjongBot:
             return False
         if len(mid_tile) < 2 or len(discard_tile) < 2:
             return False
+        if mid_tile not in ALL_TILES or discard_tile not in ALL_TILES:
+            return False
         suit = mid_tile[0]
         if suit != state.last_tile[0] or discard_tile not in state.hand:
             return False
         try:
-            mid_val = int(mid_tile[1:])
+            mid_val = tile_value(mid_tile)
         except ValueError:
             return False
+        if mid_val < 2 or mid_val > 8:
+            return False
         seq = [f'{suit}{mid_val - 1}', mid_tile, f'{suit}{mid_val + 1}']
+        if any((tile not in ALL_TILES for tile in seq)):
+            return False
         if state.last_tile not in seq:
             return False
         needed = [t for t in seq if t != state.last_tile]

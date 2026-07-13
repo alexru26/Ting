@@ -1,4 +1,5 @@
 from collections import Counter
+import logging
 import os
 from typing import List, Optional, Tuple, TYPE_CHECKING
 from tiles import normalize_tiles, is_honor, tile_suit, tile_value, min_shanten, best_discard, shanten_standard, ALL_TILES, NUMBERED_SUITS
@@ -9,6 +10,9 @@ from runtime_model import load_policy_model, choose_action_from_model
 from search_planner import BoundedRolloutPlanner
 if TYPE_CHECKING:
     from state import GameState
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _safe_float(value, default_value):
@@ -130,10 +134,13 @@ class GoalBasedPolicy:
 
     def _choose_discard(self, hand, packs, goal):
         """Choose the best tile to discard balancing goal progress and safety."""
+        if not hand:
+            return ''
+
         candidates = list(set(hand))
         n = len(packs)
         if not candidates:
-            return hand[0]
+            return ''
 
         def score(tile):
             reduced = hand[:]
@@ -143,6 +150,8 @@ class GoalBasedPolicy:
             danger = self._danger_score(tile)
             return offence - self.DEFENSE_WEIGHT * danger
         goal_tile = best_discard_for_goal(hand, packs, goal)
+        if goal_tile not in hand:
+            goal_tile = candidates[0]
         best_tile = goal_tile
         best_sc = score(goal_tile) + 0.01
         for t in candidates:
@@ -179,7 +188,6 @@ class GoalBasedPolicy:
     def _should_gang_open(self, tile, hand, packs):
         """Open kong from a discard: only do it if our hand profits."""
         reduced = [t for t in hand if t != tile]
-        reduced = reduced[1:]
         sh_before = min_shanten(hand, len(packs))
         sh_after = min_shanten(reduced, len(packs) + 1)
         return sh_after <= sh_before
@@ -190,6 +198,9 @@ class GoalBasedPolicy:
         Returns the discard tile, or None to decline.
         """
         n = len(packs)
+        if hand.count(tile) < 2:
+            return None
+
         sh_without = min_shanten(hand, n)
         new_hand = hand[:]
         new_hand.remove(tile)
@@ -414,8 +425,8 @@ class NeuralPolicy:
 
             if action and self.state.is_legal_action(action):
                 return action
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug('NeuralPolicy choose_action failed: %s', exc)
 
         return self.fallback_policy.choose_action()
 

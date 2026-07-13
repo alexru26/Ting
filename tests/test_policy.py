@@ -3,13 +3,14 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 from action_codec import ActionCodec
 from bot import MahjongBot
 from local_game import run_games
-from policy import NeuralPolicy
+from policy import GoalBasedPolicy, NeuralPolicy
 from search_planner import BoundedRolloutPlanner
 from state import GameState
 
@@ -289,5 +290,35 @@ class TestSearchTimeAugmentation(unittest.TestCase):
 
         action = policy.choose_action()
         self.assertEqual(action, 'PLAY W2')
+
+
+class TestGoalPolicySafety(unittest.TestCase):
+
+    def _make_state(self):
+        gs = GameState()
+        gs.my_id = 0
+        gs.hand = ['W1', 'W1', 'W1', 'B1', 'B2']
+        gs.packs = []
+        gs.opponent_packs = {1: [], 2: [], 3: []}
+        gs.opponent_discards = {1: [], 2: [], 3: []}
+        gs.seen_tiles = {}
+        return gs
+
+    def test_choose_discard_empty_hand_returns_empty_string(self):
+        policy = GoalBasedPolicy(self._make_state())
+        self.assertEqual(policy._choose_discard([], [], None), '')
+
+    def test_should_gang_open_removes_only_the_gang_tiles(self):
+        policy = GoalBasedPolicy(self._make_state())
+        hand = ['W1', 'W1', 'W1', 'B1', 'B2']
+        with mock.patch('policy.min_shanten', side_effect=[2, 2]) as min_shanten_mock:
+            policy._should_gang_open('W1', hand, [])
+        reduced_hand = min_shanten_mock.call_args_list[1][0][0]
+        self.assertEqual(reduced_hand, ['B1', 'B2'])
+
+    def test_peng_and_discard_returns_none_when_tile_count_is_too_low(self):
+        policy = GoalBasedPolicy(self._make_state())
+        self.assertIsNone(policy._peng_and_discard('W2', ['W1', 'B1', 'B2'], []))
+
 if __name__ == '__main__':
     unittest.main()

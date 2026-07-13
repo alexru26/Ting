@@ -1,6 +1,10 @@
 import json
+import logging
 
 from model import CnnPolicyValueModel
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def load_policy_model(path):
@@ -22,10 +26,14 @@ def choose_action_from_model(model, features, legal_actions, codec=None, belief_
     if hasattr(model, 'choose_action_from_features'):
         try:
             return model.choose_action_from_features(features, legal_actions, belief_weight=belief_weight)
-        except Exception:
+        except TypeError:
             try:
                 return model.choose_action_from_features(features, legal_actions)
-            except Exception:
+            except Exception as exc:
+                _LOGGER.debug('Model action selection failed after fallback signature: %s', exc)
                 return None
+        except Exception as exc:
+            _LOGGER.debug('Model action selection failed: %s', exc)
+            return None
 
     return None

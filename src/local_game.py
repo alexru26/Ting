@@ -147,8 +147,6 @@ class Game:
             self._take_turn(pid)
             if not self._done:
                 turn += 1
-        if not self._done:
-            pass
         return {'winner': self._winner, 'fan': self._win_fan, 'self_drawn': self._is_self_drawn, 'scores': self.scores, 'turn_logs': self.turn_logs}
 
     def _record_state(self, phase):
