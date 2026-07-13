@@ -1,7 +1,11 @@
 import ast
 import os
+import sys
 import unittest
 ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, 'src'))
+from state import GameState
 
 def _python_files():
     targets = []
@@ -53,5 +57,36 @@ class TestReadmeDatasetDocs(unittest.TestCase):
         self.assertIn('dataset', text)
         self.assertIn('--export-dataset', text)
         self.assertIn('jsonl', text)
+
+
+class TestGameStateParsingRobustness(unittest.TestCase):
+
+    def test_parse_from_history_ignores_invalid_first_request_type(self):
+        state = GameState()
+        state.parse_from_history(['2 W1'], [])
+        self.assertEqual(state.last_request_type, -1)
+        self.assertEqual(state.hand, [])
+
+    def test_parse_from_history_ignores_malformed_init_and_deal(self):
+        state = GameState()
+        state.parse_from_history(['0 0', '1 0'], [])
+        self.assertEqual(state.last_request_type, -1)
+        self.assertEqual(state.hand, [])
+
+    def test_apply_type3_chi_ignores_invalid_mid_tile(self):
+        state = GameState()
+        state.my_id = 0
+        state.hand = ['W1', 'W2', 'W4']
+        state._last_discard = 'W3'
+        state._last_discard_player = 3
+        state._apply_type3(['3', '1', 'CHI', 'W0', 'W4'], None)
+        self.assertEqual(state.opponent_packs.get(1, []), [])
+        self.assertEqual(state._last_discard, 'W3')
+
+    def test_set_current_request_ignores_malformed_payload(self):
+        state = GameState()
+        state._set_current_request('3')
+        self.assertEqual(state.last_request_type, -1)
+
 if __name__ == '__main__':
     unittest.main()

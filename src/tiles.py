@@ -20,7 +20,21 @@ def tile_suit(tile):
 def tile_value(tile):
     if len(tile) < 2:
         raise ValueError(f'Invalid tile: {tile}')
-    return int(tile[1:])
+
+    try:
+        value = int(tile[1:])
+    except ValueError as exc:
+        raise ValueError(f'Invalid tile: {tile}') from exc
+
+    suit = tile[0]
+    if suit in NUMBERED_SUITS and 1 <= value <= 9:
+        return value
+    if suit == 'F' and 1 <= value <= 4:
+        return value
+    if suit == 'J' and 1 <= value <= 3:
+        return value
+
+    raise ValueError(f'Invalid tile: {tile}')
 
 
 def is_honor(tile):

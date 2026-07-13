@@ -1,6 +1,6 @@
 from collections import Counter
 
-from tiles import NUMBERED_SUITS, normalize_tiles
+from tiles import ALL_TILES, NUMBERED_SUITS, normalize_tiles, tile_value
 
 
 class GameState:
@@ -36,12 +36,14 @@ class GameState:
         if not requests:
             return
 
-        self._parse_init(requests[0])
+        if not self._parse_init(requests[0]):
+            return
         if len(requests) == 1:
             self.last_request_type = 0
             return
 
-        self._parse_deal(requests[1])
+        if not self._parse_deal(requests[1]):
+            return
         if len(requests) == 2:
             self.last_request_type = 1
             return
@@ -52,28 +54,68 @@ class GameState:
 
         self._set_current_request(requests[-1])
 
+    @staticmethod
+    def _parse_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_valid_tile(tile):
+        return tile in ALL_TILES
+
     def _parse_init(self, req):
         parts = req.split()
-        self.my_id = int(parts[1])
-        self.quan = int(parts[2])
+        if len(parts) < 3:
+            return False
+
+        req_type = self._parse_int(parts[0])
+        my_id = self._parse_int(parts[1])
+        quan = self._parse_int(parts[2])
+        if req_type != 0 or my_id is None or quan is None or my_id < 0 or my_id > 3:
+            return False
+
+        self.my_id = my_id
+        self.quan = quan
         for pid in range(4):
             if pid != self.my_id:
                 self.opponent_discards[pid] = []
                 self.opponent_packs[pid] = []
+        return True
 
     def _parse_deal(self, req):
         parts = req.split()
-        self.flowers = int(parts[self.my_id + 1])
+        flower_index = self.my_id + 1
+        if len(parts) <= flower_index:
+            return False
+
+        req_type = self._parse_int(parts[0])
+        flower_count = self._parse_int(parts[flower_index])
+        if req_type != 1 or flower_count is None:
+            return False
+
+        self.flowers = flower_count
         self.hand = [t for t in parts[5:18] if not t.startswith('H')]
+        return True
 
     def _apply_request(self, req, response):
         parts = req.split()
-        req_type = int(parts[0])
+        if not parts:
+            return
+
+        req_type = self._parse_int(parts[0])
+        if req_type is None:
+            return
 
         if req_type == 2:
+            if len(parts) < 2:
+                return
             tile = parts[1]
             if tile.startswith('H'):
                 self.flowers += 1
+                return
+            if not self._is_valid_tile(tile):
                 return
             self.hand.append(tile)
             if response:
@@ -87,14 +129,23 @@ class GameState:
             self._apply_type3(parts, response)
 
     def _apply_type3(self, parts, _response):
-        actor = int(parts[1])
+        if len(parts) < 3:
+            return
+
+        actor = self._parse_int(parts[1])
+        if actor is None:
+            return
         action = parts[2]
 
         if action == 'DRAW' or action == 'BUHUA':
             return
 
         if action == 'PLAY':
+            if len(parts) < 4:
+                return
             tile = parts[3]
+            if not self._is_valid_tile(tile):
+                return
             self._last_discard = tile
             self._last_discard_player = actor
             if actor == self.my_id:
@@ -106,6 +157,8 @@ class GameState:
 
         if action == 'PENG':
             disc = parts[3] if len(parts) > 3 else None
+            if disc is not None and not self._is_valid_tile(disc):
+                disc = None
             penged = self._last_discard
             giver = self._last_discard_player
             if actor == self.my_id and penged:
@@ -131,26 +184,34 @@ class GameState:
             mid = parts[3] if len(parts) > 3 else None
             disc = parts[4] if len(parts) > 4 else None
             claimed = self._last_discard
-            if mid:
-                mid_val = int(mid[1:])
-                suit = mid[0]
-                seq = ['%s%d' % (suit, mid_val - 1), mid, '%s%d' % (suit, mid_val + 1)]
-                for t in seq:
-                    self.seen_tiles[t] += 1
-                if actor == self.my_id and claimed:
-                    offer = seq.index(claimed) if claimed in seq else 0
-                    for t in [x for x in seq if x != claimed]:
-                        if t in self.hand:
-                            self.hand.remove(t)
-                    self.packs.append(('CHI', mid, offer))
-                    if disc:
-                        self._discard_from_hand(disc)
-                else:
-                    self.opponent_packs.setdefault(actor, []).append(('CHI', mid, 0))
-                    if disc:
-                        self.opponent_discards.setdefault(actor, []).append(disc)
-                        self.seen_tiles[disc] += 1
-            if disc:
+            if not mid or not self._is_valid_tile(mid):
+                return
+            try:
+                mid_val = tile_value(mid)
+            except ValueError:
+                return
+            suit = mid[0]
+            if suit not in NUMBERED_SUITS:
+                return
+            seq = ['%s%d' % (suit, mid_val - 1), mid, '%s%d' % (suit, mid_val + 1)]
+            if any((not self._is_valid_tile(t) for t in seq)):
+                return
+            for t in seq:
+                self.seen_tiles[t] += 1
+            if actor == self.my_id and claimed:
+                offer = seq.index(claimed) if claimed in seq else 0
+                for t in [x for x in seq if x != claimed]:
+                    if t in self.hand:
+                        self.hand.remove(t)
+                self.packs.append(('CHI', mid, offer))
+                if disc:
+                    self._discard_from_hand(disc)
+            else:
+                self.opponent_packs.setdefault(actor, []).append(('CHI', mid, 0))
+                if disc and self._is_valid_tile(disc):
+                    self.opponent_discards.setdefault(actor, []).append(disc)
+                    self.seen_tiles[disc] += 1
+            if disc and self._is_valid_tile(disc):
                 self._last_discard = disc
                 self._last_discard_player = actor
             return
@@ -181,7 +242,7 @@ class GameState:
 
         if action == 'BUGANG':
             tile = parts[3] if len(parts) > 3 else None
-            if tile:
+            if tile and self._is_valid_tile(tile):
                 self.seen_tiles[tile] += 1
                 if actor == self.my_id:
                     if tile in self.hand:
@@ -206,22 +267,38 @@ class GameState:
 
     def _set_current_request(self, req):
         parts = req.split()
-        req_type = int(parts[0])
+        if not parts:
+            return
+
+        req_type = self._parse_int(parts[0])
+        if req_type is None:
+            return
         self.last_request_type = req_type
         self.last_request_action = None
         self.last_tile = None
         self.last_actor = None
 
         if req_type == 2:
+            if len(parts) < 2:
+                self.last_request_type = -1
+                return
             tile = parts[1]
             self.last_tile = tile
             if not tile.startswith('H'):
-                self.hand.append(tile)
+                if self._is_valid_tile(tile):
+                    self.hand.append(tile)
             else:
                 self.flowers += 1
 
         elif req_type == 3:
-            self.last_actor = int(parts[1])
+            if len(parts) < 3:
+                self.last_request_type = -1
+                return
+            actor = self._parse_int(parts[1])
+            if actor is None:
+                self.last_request_type = -1
+                return
+            self.last_actor = actor
             self.last_request_action = parts[2]
             self.last_tile = parts[3] if len(parts) > 3 else None
             self._apply_type3(parts, None)

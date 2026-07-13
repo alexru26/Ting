@@ -8,6 +8,7 @@ from dataset import JsonlTrajectoryReader, create_mixed_split_manifest, ingest_e
 from model import CnnPolicyValueModel
 from external_ingest import build_opponent_registry, ingest_games_directory
 from ml_packages import package_profile
+import runtime_model
 
 
 def make_feature_key(features):
@@ -69,18 +70,7 @@ def _ece(confidences, outcomes, bin_count=10):
 
 
 def load_policy_model(path):
-    with open(path, 'rb') as handle:
-        header = handle.read(8)
-
-    if header == b'\x89HDF\r\n\x1a\n':
-        return CnnPolicyValueModel.load(path)
-
-    with open(path, 'r', encoding='utf-8') as handle:
-        payload = json.load(handle)
-
-    if not isinstance(payload, dict):
-        raise ValueError('Invalid checkpoint payload.')
-    return CnnPolicyValueModel.from_dict(payload)
+    return runtime_model.load_policy_model(path)
 
 
 def _iter_records(dataset_path, max_records=None):

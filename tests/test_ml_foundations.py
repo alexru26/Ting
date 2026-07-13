@@ -134,5 +134,32 @@ class TestPolicyModeSelection(unittest.TestCase):
         self.assertEqual(policy.choose_action(), 'PASS')
 
 
+class TestBotFallbackAndChiValidation(unittest.TestCase):
+    def test_fallback_action_draw_plays_first_tile_or_passes(self):
+        bot = MahjongBot()
+
+        draw_state = GameState()
+        draw_state.last_request_type = 2
+        draw_state.hand = ['W7', 'W8']
+        self.assertEqual(bot._fallback_action(draw_state), 'PLAY W7')
+
+        empty_draw_state = GameState()
+        empty_draw_state.last_request_type = 2
+        empty_draw_state.hand = []
+        self.assertEqual(bot._fallback_action(empty_draw_state), 'PASS')
+
+    def test_can_chi_rejects_out_of_range_or_non_numeric_mid(self):
+        bot = MahjongBot()
+        state = GameState()
+        state.my_id = 0
+        state.last_actor = 3
+        state.last_tile = 'W3'
+        state.hand = ['W2', 'W4', 'B1']
+
+        self.assertFalse(bot._can_chi(state, 'W0', 'W2'))
+        self.assertFalse(bot._can_chi(state, 'W10', 'W2'))
+        self.assertFalse(bot._can_chi(state, 'WX', 'W2'))
+
+
 if __name__ == '__main__':
     unittest.main()
