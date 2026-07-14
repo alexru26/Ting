@@ -250,12 +250,15 @@ def run_ppo_fine_tuning(
     fan_weight=0.0,
     placement_weight=0.0,
     game_factory=None,
+    device='cpu',
 ):
-    model = CnnPolicyValueModel.load(model_path)
+    model = CnnPolicyValueModel.load(model_path, device=device)
     game_factory = game_factory or Game
 
     train_summary = {
         'model_path': model_path,
+        'requested_device': model.requested_device,
+        'resolved_device': model.resolved_device,
         'episodes': 0,
         'policy_updates': 0,
         'policy_loss': 0.0,
@@ -322,6 +325,7 @@ def run_ppo_fine_tuning(
         quan=quan,
         candidate_seat=candidate_seat,
         game_factory=game_factory,
+        device=device,
     )
     train_summary['promoted'] = promotion_gate(
         train_summary['evaluation'],
@@ -331,8 +335,8 @@ def run_ppo_fine_tuning(
     return train_summary
 
 
-def evaluate_against_baseline(model_path, games=16, seed=42, quan=0, candidate_seat=0, game_factory=None):
-    model = CnnPolicyValueModel.load(model_path)
+def evaluate_against_baseline(model_path, games=16, seed=42, quan=0, candidate_seat=0, game_factory=None, device='cpu'):
+    model = CnnPolicyValueModel.load(model_path, device=device)
     game_factory = game_factory or Game
 
     summary = {
@@ -448,6 +452,7 @@ def main():
     ppo_train_parser.add_argument('--score-delta-weight', type=float, default=1.0, help='Reward weight for score delta')
     ppo_train_parser.add_argument('--fan-weight', type=float, default=0.0, help='Reward weight for fan bonus')
     ppo_train_parser.add_argument('--placement-weight', type=float, default=0.0, help='Reward weight for placement proxy')
+    ppo_train_parser.add_argument('--device', default='cpu', help='Torch device: cpu, cuda, cuda:0, or auto')
 
     ppo_eval_parser = sub.add_parser('ppo-eval', help='Evaluate a candidate checkpoint against baseline opponents')
     ppo_eval_parser.add_argument('--model', required=True, help='Model checkpoint path to evaluate')
@@ -455,6 +460,7 @@ def main():
     ppo_eval_parser.add_argument('--seed', type=int, default=42, help='Base random seed')
     ppo_eval_parser.add_argument('--quan', type=int, default=0, help='Prevalent wind')
     ppo_eval_parser.add_argument('--candidate-seat', type=int, default=0, help='Seat index controlled by the candidate')
+    ppo_eval_parser.add_argument('--device', default='cpu', help='Torch device: cpu, cuda, cuda:0, or auto')
 
     args = parser.parse_args()
 
@@ -486,6 +492,7 @@ def main():
             score_delta_weight=args.score_delta_weight,
             fan_weight=args.fan_weight,
             placement_weight=args.placement_weight,
+            device=args.device,
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
         return
@@ -497,6 +504,7 @@ def main():
             seed=args.seed,
             quan=args.quan,
             candidate_seat=args.candidate_seat,
+            device=args.device,
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
         return

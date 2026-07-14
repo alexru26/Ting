@@ -11,7 +11,7 @@ from action_codec import ActionCodec
 from dataset import JsonlTrajectoryWriter, TrajectoryRecord
 from imitation import choose_action_from_model, evaluate_cnn, load_policy_model, train_cnn
 from ml_packages import package_profile
-from model import CnnPolicyValueModel
+from model import CnnPolicyValueModel, resolve_device
 
 
 def _feature_bundle(marker):
@@ -45,6 +45,31 @@ def _feature_bundle(marker):
 
 
 class TestCnnModel(unittest.TestCase):
+    def test_resolve_device_auto_falls_back_or_uses_cuda(self):
+        resolved, requested, resolved_name = resolve_device('auto')
+        self.assertIn(requested, ['auto'])
+        self.assertIn(resolved_name, ['cpu', 'cuda'])
+        self.assertEqual(str(resolved), resolved_name)
+
+    def test_train_cnn_records_requested_and_resolved_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = os.path.join(tmp, 'train.jsonl')
+            model_path = os.path.join(tmp, 'model.h5')
+            self._write_dataset(dataset_path)
+
+            result = train_cnn(
+                dataset_path=dataset_path,
+                model_out_path=model_path,
+                epochs=1,
+                hidden_size=8,
+                learning_rate=0.01,
+                device='auto',
+            )
+
+            metadata = result.get('metadata', {})
+            self.assertEqual(metadata.get('requested_device'), 'auto')
+            self.assertIn(metadata.get('resolved_device'), ['cpu', 'cuda'])
+
     def _write_dataset(self, path):
         with JsonlTrajectoryWriter(path) as writer:
             writer.write(

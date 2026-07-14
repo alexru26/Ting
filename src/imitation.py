@@ -187,6 +187,7 @@ def train_cnn(
     ablate_belief=False,
     ablate_efficiency=False,
     ablate_search=False,
+    device='cpu',
 ):
     model_out_path = _resolve_model_out_path(model_out_path)
     codec = ActionCodec()
@@ -194,6 +195,7 @@ def train_cnn(
         action_space_size=codec.size,
         hidden_size=hidden_size,
         learning_rate=learning_rate,
+        device=device,
     )
 
     dropped_forced = 0
@@ -254,6 +256,8 @@ def train_cnn(
             },
             'dropped_forced_records': int(dropped_forced),
             'package_profile': package_profile(),
+            'requested_device': model.requested_device,
+            'resolved_device': model.resolved_device,
         }
     )
     model.save(model_out_path)
@@ -393,6 +397,7 @@ def _cmd_train_cnn(args):
         ablate_belief=args.ablate_belief,
         ablate_efficiency=args.ablate_efficiency,
         ablate_search=args.ablate_search,
+        device=args.device,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
@@ -475,6 +480,7 @@ def main():
     train_cnn_parser.add_argument('--ablate-belief', action='store_true', help='Ablate belief-consistency loss terms')
     train_cnn_parser.add_argument('--ablate-efficiency', action='store_true', help='Ablate efficiency bonus usage in training')
     train_cnn_parser.add_argument('--ablate-search', action='store_true', help='Record search ablation setting in metadata')
+    train_cnn_parser.add_argument('--device', default='cpu', help='Torch device: cpu, cuda, cuda:0, or auto')
     train_cnn_parser.set_defaults(func=_cmd_train_cnn)
 
     eval_cnn_parser = sub.add_parser('eval-cnn', help='Evaluate CNN policy-value model on JSONL trajectory dataset')
