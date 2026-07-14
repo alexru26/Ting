@@ -142,12 +142,15 @@ class TestRlSelfPlay(unittest.TestCase):
                 game_factory=_FakePpoGame,
                 promote_min_win_rate=0.5,
                 promote_min_avg_score_delta=0.0,
+                device='auto',
             )
 
             self.assertEqual(summary['episodes'], 4)
             self.assertGreater(summary['policy_updates'], 0)
             self.assertTrue(summary['promoted'])
             self.assertEqual(summary['evaluation']['candidate_win_rate'], 1.0)
+            self.assertEqual(summary['requested_device'], 'auto')
+            self.assertIn(summary['resolved_device'], ['cpu', 'cuda'])
             self.assertTrue(os.path.exists(model_path))
 
     def test_promotion_gate_checks_metrics(self):

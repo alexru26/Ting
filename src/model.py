@@ -65,6 +65,27 @@ def _safe_float(value, default_value):
         return default_value
 
 
+def resolve_device(requested_device='cpu'):
+    requested = str(requested_device or 'cpu').strip().lower()
+    if not requested:
+        requested = 'cpu'
+
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda'), requested, 'cuda'
+        return torch.device('cpu'), requested, 'cpu'
+
+    if requested.startswith('cuda'):
+        if torch.cuda.is_available():
+            try:
+                return torch.device(requested), requested, requested
+            except Exception:
+                return torch.device('cuda'), requested, 'cuda'
+        return torch.device('cpu'), requested, 'cpu'
+
+    return torch.device('cpu'), requested, 'cpu'
+
+
 class CnnCore(nn.Module):
     def __init__(self, hidden_size, family_size, arg_size):
         super().__init__()
@@ -138,6 +159,7 @@ class CnnPolicyValueModel:
         seed=7,
         state_dict=None,
         metadata=None,
+        device='cpu',
     ):
         self.action_space_size = int(action_space_size)
         self.hidden_size = int(hidden_size)
@@ -151,7 +173,10 @@ class CnnPolicyValueModel:
         self.family_index = {label: idx for idx, label in enumerate(self.family_vocab)}
         self.arg_vocab = list(ALL_TILES) + [NONE_TOKEN]
         self.arg_index = {label: idx for idx, label in enumerate(self.arg_vocab)}
-        self.device = torch.device('cpu')
+        resolved_device, requested_device_name, resolved_device_name = resolve_device(device)
+        self.device = resolved_device
+        self.requested_device = requested_device_name
+        self.resolved_device = resolved_device_name
         torch.manual_seed(self.seed)
 
         self.calibration_temperature = max(1e-3, _safe_float(self.metadata.get('calibration_temperature', 1.0), 1.0))
@@ -770,10 +795,11 @@ class CnnPolicyValueModel:
             'package_profile': self.package_profile,
             'state_dict': self.state_dict(),
             'metadata': self.metadata,
+            'device': self.resolved_device,
         }
 
     @classmethod
-    def from_dict(cls, payload):
+    def from_dict(cls, payload, device='cpu'):
         if not isinstance(payload, dict):
             raise ValueError('Invalid checkpoint payload.')
         if _safe_int(payload.get('action_space_size', 0), 0) <= 0:
@@ -784,6 +810,7 @@ class CnnPolicyValueModel:
             learning_rate=payload.get('learning_rate', 0.001),
             seed=payload.get('seed', 7),
             metadata=payload.get('metadata', {}),
+            device=device,
         )
         state_payload = payload.get('state_dict') or payload.get('weights')
         if isinstance(state_payload, dict) and state_payload:
@@ -812,7 +839,7 @@ class CnnPolicyValueModel:
                 state_group.create_dataset(key, data=tensor.numpy())
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, device='cpu'):
         with open(path, 'rb') as handle:
             header = handle.read(8)
 
@@ -833,8 +860,8 @@ class CnnPolicyValueModel:
                     'state_dict': state_dict,
                     'metadata': json.loads(handle.attrs.get('metadata', '{}')),
                 }
-            return cls.from_dict(payload)
+            return cls.from_dict(payload, device=device)
 
         with open(path, 'r', encoding='utf-8') as handle:
             payload = json.load(handle)
-        return cls.from_dict(payload)
+        return cls.from_dict(payload, device=device)
