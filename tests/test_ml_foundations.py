@@ -161,5 +161,25 @@ class TestBotFallbackAndChiValidation(unittest.TestCase):
         self.assertFalse(bot._can_chi(state, 'WX', 'W2'))
 
 
+class TestRiskProfileEfficiencyDefaults(unittest.TestCase):
+    def _make_state(self):
+        gs = GameState()
+        gs.my_id = 0
+        gs.hand = ['W1', 'W2', 'W3']
+        gs.last_request_type = 2
+        gs.last_request_action = 'DRAW'
+        gs.last_tile = 'W4'
+        gs.last_actor = 0
+        return gs
+
+    def test_efficiency_weight_varies_by_risk_mode(self):
+        conservative = NeuralPolicy(self._make_state(), adaptation={'risk_mode': 'conservative'})
+        balanced = NeuralPolicy(self._make_state(), adaptation={'risk_mode': 'balanced'})
+        aggressive = NeuralPolicy(self._make_state(), adaptation={'risk_mode': 'aggressive'})
+
+        self.assertLess(conservative._efficiency_weight(), balanced._efficiency_weight())
+        self.assertLess(balanced._efficiency_weight(), aggressive._efficiency_weight())
+
+
 if __name__ == '__main__':
     unittest.main()

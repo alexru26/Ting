@@ -69,6 +69,64 @@ def _ece(confidences, outcomes, bin_count=10):
     return ece_value
 
 
+def _brier(confidences, outcomes):
+    if not confidences:
+        return 0.0
+    total = 0.0
+    for conf, outcome in zip(confidences, outcomes):
+        delta = float(conf) - float(outcome)
+        total += delta * delta
+    return total / float(len(confidences))
+
+
+def _temperature_rescale_distribution(probs, temperature):
+    if not probs:
+        return {}
+    t = max(1e-3, float(temperature))
+    weighted = {}
+    total = 0.0
+    for action, prob in probs.items():
+        p = max(1e-12, float(prob))
+        value = p ** (1.0 / t)
+        weighted[action] = value
+        total += value
+    if total <= 0.0:
+        uniform = 1.0 / float(len(weighted))
+        return {action: uniform for action in weighted}
+    return {action: value / total for action, value in weighted.items()}
+
+
+def _select_calibration_temperature(model, dataset_path, max_records=None):
+    candidate_temperatures = [0.7, 0.85, 1.0, 1.15, 1.3, 1.5]
+    best_temperature = 1.0
+    best_nll = None
+    for temperature in candidate_temperatures:
+        nll_sum = 0.0
+        evaluated = 0
+        for record in _iter_records(dataset_path, max_records=max_records):
+            legal_actions = list(record.legal_actions or [])
+            if not legal_actions:
+                continue
+            if record.action not in legal_actions:
+                legal_actions.append(record.action)
+
+            probs = model.action_distribution_from_features(record.features, legal_actions)
+            if not probs:
+                continue
+            scaled = _temperature_rescale_distribution(probs, temperature)
+            p_true = max(1e-12, float(scaled.get(record.action, 0.0)))
+            nll_sum += -math.log(p_true)
+            evaluated += 1
+
+        if evaluated <= 0:
+            continue
+        nll = nll_sum / float(evaluated)
+        if best_nll is None or nll < best_nll:
+            best_nll = nll
+            best_temperature = temperature
+    return float(best_temperature)
+
+
 def load_policy_model(path):
     return runtime_model.load_policy_model(path)
 
@@ -124,6 +182,11 @@ def train_cnn(
     value_weight=0.5,
     belief_weight=0.25,
     forced_policy_weight=0.0,
+    ablate_encoder=False,
+    ablate_features=False,
+    ablate_belief=False,
+    ablate_efficiency=False,
+    ablate_search=False,
 ):
     model_out_path = _resolve_model_out_path(model_out_path)
     codec = ActionCodec()
@@ -159,7 +222,13 @@ def train_cnn(
         value_weight=value_weight,
         belief_weight=belief_weight,
         forced_policy_weight=forced_policy_weight,
+        aux_value_weight=0.15,
+        efficiency_weight=0.0 if ablate_efficiency else 0.1,
+        belief_consistency_weight=0.0 if ablate_belief else 0.1,
     )
+    selected_temperature = _select_calibration_temperature(model, dataset_path, max_records=max_records)
+    model.set_calibration_temperature(selected_temperature)
+
     model.metadata.update(
         {
             'dataset_path': dataset_path,
@@ -174,6 +243,15 @@ def train_cnn(
             'value_weight': float(value_weight),
             'belief_weight': float(belief_weight),
             'forced_policy_weight': float(forced_policy_weight),
+            'promotion_metric': 'top1_masked_accuracy',
+            'calibration_temperature': float(selected_temperature),
+            'ablation': {
+                'encoder': bool(ablate_encoder),
+                'features': bool(ablate_features),
+                'belief': bool(ablate_belief),
+                'efficiency': bool(ablate_efficiency),
+                'search': bool(ablate_search),
+            },
             'dropped_forced_records': int(dropped_forced),
             'package_profile': package_profile(),
         }
@@ -198,6 +276,9 @@ def evaluate_cnn(dataset_path, model_path, top_ks=None, max_records=None):
     outcomes = []
     masked_xent_sum = 0.0
     value_mse_sum = 0.0
+    nll_sum = 0.0
+    brier_sum = 0.0
+    calibration_temperature = _safe_float(model.metadata.get('calibration_temperature', 1.0), 1.0)
 
     for record in _iter_records(dataset_path, max_records=max_records):
         legal_actions = list(record.legal_actions or [])
@@ -211,6 +292,8 @@ def evaluate_cnn(dataset_path, model_path, top_ks=None, max_records=None):
         if not probs:
             continue
 
+        probs = _temperature_rescale_distribution(probs, calibration_temperature)
+
         ranked = sorted(probs.items(), key=lambda item: (-item[1], item[0]))
         ranked_actions = [action for action, _ in ranked]
 
@@ -221,10 +304,14 @@ def evaluate_cnn(dataset_path, model_path, top_ks=None, max_records=None):
 
         p_true = max(1e-12, float(probs.get(record.action, 0.0)))
         masked_xent_sum += -math.log(p_true)
+        nll_sum += -math.log(p_true)
 
         top1 = ranked_actions[0]
-        confidences.append(float(probs.get(top1, 0.0)))
-        outcomes.append(1 if top1 == record.action else 0)
+        top1_conf = float(probs.get(top1, 0.0))
+        top1_outcome = 1 if top1 == record.action else 0
+        confidences.append(top1_conf)
+        outcomes.append(top1_outcome)
+        brier_sum += (top1_conf - float(top1_outcome)) * (top1_conf - float(top1_outcome))
 
         value_pred = model.estimate_value_from_features(record.features)
         value_true = _safe_float(record.reward, 0.0)
@@ -235,8 +322,11 @@ def evaluate_cnn(dataset_path, model_path, top_ks=None, max_records=None):
         'total_evaluated': total,
         'topk_accuracy': {},
         'masked_cross_entropy': 0.0,
+        'nll': 0.0,
         'value_mse': 0.0,
         'ece': _ece(confidences, outcomes),
+        'brier': _brier(confidences, outcomes),
+        'calibration_temperature': calibration_temperature,
     }
 
     for k in top_ks:
@@ -247,15 +337,23 @@ def evaluate_cnn(dataset_path, model_path, top_ks=None, max_records=None):
 
     if total > 0:
         metrics['masked_cross_entropy'] = masked_xent_sum / float(total)
+        metrics['nll'] = nll_sum / float(total)
         metrics['value_mse'] = value_mse_sum / float(total)
+        metrics['brier'] = brier_sum / float(total)
 
     return metrics
 
 
-def choose_action_from_model(model, features, legal_actions, codec=None, belief_weight=0.0):
+def choose_action_from_model(model, features, legal_actions, codec=None, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
     if hasattr(model, 'choose_action_from_features'):
         try:
-            return model.choose_action_from_features(features, legal_actions, belief_weight=belief_weight)
+            return model.choose_action_from_features(
+                features,
+                legal_actions,
+                belief_weight=belief_weight,
+                efficiency_weight=efficiency_weight,
+                temperature=temperature,
+            )
         except Exception:
             try:
                 return model.choose_action_from_features(features, legal_actions)
@@ -290,6 +388,11 @@ def _cmd_train_cnn(args):
         value_weight=args.value_weight,
         belief_weight=args.belief_weight,
         forced_policy_weight=args.forced_policy_weight,
+        ablate_encoder=args.ablate_encoder,
+        ablate_features=args.ablate_features,
+        ablate_belief=args.ablate_belief,
+        ablate_efficiency=args.ablate_efficiency,
+        ablate_search=args.ablate_search,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
@@ -367,6 +470,11 @@ def main():
     train_cnn_parser.add_argument('--value-weight', type=float, default=0.5, help='Value loss multiplier')
     train_cnn_parser.add_argument('--belief-weight', type=float, default=0.25, help='Belief KL loss multiplier')
     train_cnn_parser.add_argument('--forced-policy-weight', type=float, default=0.0, help='Policy loss multiplier for forced states')
+    train_cnn_parser.add_argument('--ablate-encoder', action='store_true', help='Disable encoder-related upgrades (metadata/ablation only)')
+    train_cnn_parser.add_argument('--ablate-features', action='store_true', help='Disable feature upgrades (metadata/ablation only)')
+    train_cnn_parser.add_argument('--ablate-belief', action='store_true', help='Ablate belief-consistency loss terms')
+    train_cnn_parser.add_argument('--ablate-efficiency', action='store_true', help='Ablate efficiency bonus usage in training')
+    train_cnn_parser.add_argument('--ablate-search', action='store_true', help='Record search ablation setting in metadata')
     train_cnn_parser.set_defaults(func=_cmd_train_cnn)
 
     eval_cnn_parser = sub.add_parser('eval-cnn', help='Evaluate CNN policy-value model on JSONL trajectory dataset')

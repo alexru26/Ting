@@ -320,6 +320,8 @@ class NeuralPolicy:
             'search_top_k': _safe_float(os.getenv('TING_POLICY_SEARCH_TOP_K', 3.0), 3.0),
             'search_rollout_samples': _safe_float(os.getenv('TING_POLICY_SEARCH_SAMPLES', 8.0), 8.0),
             'search_belief_weight': _safe_float(os.getenv('TING_POLICY_SEARCH_BELIEF_WEIGHT', 0.5), 0.5),
+            'search_efficiency_weight': _safe_float(os.getenv('TING_POLICY_SEARCH_EFFICIENCY_WEIGHT', 0.2), 0.2),
+            'calibration_temperature': _safe_float(os.getenv('TING_POLICY_CALIBRATION_TEMPERATURE', 1.0), 1.0),
         }
         if isinstance(adaptation, dict):
             config.update(adaptation)
@@ -342,7 +344,24 @@ class NeuralPolicy:
             budget_ms=_safe_int(self.adaptation.get('search_budget_ms', 12), 12),
             disabled=False,
             belief_weight=_safe_float(self.adaptation.get('search_belief_weight', 0.5), 0.5),
+            efficiency_weight=_safe_float(self.adaptation.get('search_efficiency_weight', 0.2), 0.2),
         )
+
+    def _effective_calibration_temperature(self):
+        configured = _safe_float(self.adaptation.get('calibration_temperature', 1.0), 1.0)
+        model_temp = 1.0
+        if self.model is not None:
+            model_temp = _safe_float(getattr(self.model, 'calibration_temperature', 1.0), 1.0)
+        return max(0.05, configured * model_temp)
+
+    def _efficiency_weight(self):
+        risk_mode = str(self.adaptation.get('risk_mode', 'balanced')).strip().lower()
+        # Risk-tuned defaults: aggressive values throughput, conservative suppresses noisy efficiency spikes.
+        if risk_mode == 'conservative':
+            return 0.1
+        if risk_mode == 'aggressive':
+            return 0.35
+        return 0.2
 
     def _adaptive_temperature(self, info):
         temperature = max(0.05, _safe_float(self.adaptation.get('temperature', 1.0), 1.0))
@@ -384,7 +403,8 @@ class NeuralPolicy:
 
         threshold = _safe_float(self.adaptation.get('uncertainty_threshold', 3.0), 3.0)
         risk_mode = str(self.adaptation.get('risk_mode', 'balanced')).strip().lower()
-        uncertainty = max(_safe_float(info.get('entropy', 0.0), 0.0), _safe_float(info.get('belief_entropy', 0.0), 0.0))
+        temperature = self._effective_calibration_temperature()
+        uncertainty = max(_safe_float(info.get('entropy', 0.0), 0.0), _safe_float(info.get('belief_entropy', 0.0), 0.0)) * temperature
 
         if risk_mode == 'aggressive':
             threshold *= 1.5
@@ -403,9 +423,23 @@ class NeuralPolicy:
                 return self.fallback_policy.choose_action()
 
             features = self.feature_extractor.extract(self.state)
-            base_info = self.model.policy_info_from_features(features, legal_actions, belief_weight=0.0)
+            temperature = self._effective_calibration_temperature()
+            efficiency_weight = self._efficiency_weight()
+            base_info = self.model.policy_info_from_features(
+                features,
+                legal_actions,
+                belief_weight=0.0,
+                efficiency_weight=efficiency_weight,
+                temperature=temperature,
+            )
             belief_weight = self._belief_weight(base_info)
-            info = self.model.policy_info_from_features(features, legal_actions, belief_weight=belief_weight)
+            info = self.model.policy_info_from_features(
+                features,
+                legal_actions,
+                belief_weight=belief_weight,
+                efficiency_weight=efficiency_weight,
+                temperature=temperature,
+            )
             if self._should_fallback_on_uncertainty(info):
                 return self.fallback_policy.choose_action()
 
@@ -415,6 +449,8 @@ class NeuralPolicy:
                 legal_actions=legal_actions,
                 codec=self.codec,
                 belief_weight=belief_weight,
+                efficiency_weight=efficiency_weight,
+                temperature=temperature,
             )
 
             planner = self._build_search_planner()

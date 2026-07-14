@@ -153,6 +153,9 @@ class TestImitationNeuralOnly(unittest.TestCase):
             self.assertEqual(metrics['total_evaluated'], 3)
             self.assertGreaterEqual(metrics['topk_accuracy']['1'], 1.0 / 3.0)
             self.assertGreaterEqual(metrics['topk_accuracy']['3'], 1.0)
+            self.assertGreaterEqual(metrics['nll'], 0.0)
+            self.assertGreaterEqual(metrics['brier'], 0.0)
+            self.assertGreater(metrics['calibration_temperature'], 0.0)
 
             model = load_policy_model(model_path)
             action = choose_action_from_model(
@@ -234,6 +237,30 @@ class TestImitationNeuralOnly(unittest.TestCase):
             self.assertEqual(metadata['value_weight'], 0.75)
             self.assertEqual(metadata['belief_weight'], 0.15)
             self.assertEqual(metadata['forced_policy_weight'], 0.0)
+
+    def test_train_cnn_records_ablation_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = os.path.join(tmp, 'train.jsonl')
+            model_path = os.path.join(tmp, 'model.h5')
+            self._write_dataset(dataset_path)
+
+            train_result = train_cnn(
+                dataset_path=dataset_path,
+                model_out_path=model_path,
+                epochs=1,
+                ablate_encoder=True,
+                ablate_features=True,
+                ablate_belief=True,
+                ablate_efficiency=True,
+                ablate_search=True,
+            )
+
+            ablation = train_result['metadata']['ablation']
+            self.assertTrue(ablation['encoder'])
+            self.assertTrue(ablation['features'])
+            self.assertTrue(ablation['belief'])
+            self.assertTrue(ablation['efficiency'])
+            self.assertTrue(ablation['search'])
 
 
 if __name__ == '__main__':
