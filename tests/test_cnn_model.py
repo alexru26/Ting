@@ -107,8 +107,10 @@ class TestCnnModel(unittest.TestCase):
             self.assertEqual(metrics['total_evaluated'], 3)
             self.assertGreaterEqual(metrics['topk_accuracy']['1'], 2.0 / 3.0)
             self.assertGreaterEqual(metrics['masked_cross_entropy'], 0.0)
+            self.assertGreaterEqual(metrics['nll'], 0.0)
             self.assertGreaterEqual(metrics['value_mse'], 0.0)
             self.assertGreaterEqual(metrics['ece'], 0.0)
+            self.assertGreaterEqual(metrics['brier'], 0.0)
 
             model = load_policy_model(model_path)
             action = choose_action_from_model(
@@ -137,6 +139,10 @@ class TestCnnModel(unittest.TestCase):
         shaped = model.train_step(features, ['PASS', 'PLAY W1'], 'PLAY W1', 1.0)
         self.assertIn('belief_loss', shaped)
         self.assertGreaterEqual(shaped['belief_loss'], 0.0)
+        self.assertIn('aux_value_loss', shaped)
+        self.assertGreaterEqual(shaped['aux_value_loss'], 0.0)
+        self.assertIn('belief_consistency_loss', shaped)
+        self.assertGreaterEqual(shaped['belief_consistency_loss'], 0.0)
         self.assertIn('weighted_total_loss', shaped)
         self.assertGreaterEqual(shaped['weighted_total_loss'], 0.0)
 
@@ -144,6 +150,23 @@ class TestCnnModel(unittest.TestCase):
         belief_action = model.choose_action_from_features(features, ['PASS', 'PLAY W1'], belief_weight=3.0)
         self.assertIn(base_action, ['PASS', 'PLAY W1'])
         self.assertIn(belief_action, ['PASS', 'PLAY W1'])
+
+    def test_conditioned_decode_and_legal_masking(self):
+        codec = ActionCodec()
+        model = CnnPolicyValueModel(
+            action_space_size=codec.size,
+            hidden_size=16,
+            learning_rate=0.05,
+        )
+        features = _feature_bundle(6)
+        legal_actions = ['PASS', 'PLAY W1']
+
+        chosen = model.decode_conditioned_action_from_features(features, legal_actions=legal_actions, deterministic=True)
+        self.assertIn(chosen, legal_actions)
+
+        distribution = model.action_distribution_from_features(features, legal_actions)
+        self.assertEqual(set(distribution.keys()), set(legal_actions))
+        self.assertAlmostEqual(sum(distribution.values()), 1.0, places=5)
 
     def test_backward_compatible_load_without_belief_keys(self):
         codec = ActionCodec()

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from typing import Any, cast
 
@@ -42,8 +43,11 @@ REQUEST_VOCAB = [
 
 
 TILE_COUNT = len(ALL_TILES)
-CHANNEL_COUNT = 7
-META_COUNT = 8 + 3 + len(EVENT_VOCAB) + len(REQUEST_VOCAB)
+CHANNEL_COUNT = 11
+TEMPORAL_FEATURES_PER_OPPONENT = 7
+TEMPORAL_OPPONENT_COUNT = 3
+EXTRA_META_COUNT = 1 + 1 + 3 + (TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT)
+META_COUNT = 8 + 3 + len(EVENT_VOCAB) + len(REQUEST_VOCAB) + EXTRA_META_COUNT
 INPUT_SIZE = TILE_COUNT * CHANNEL_COUNT + META_COUNT
 
 
@@ -64,39 +68,65 @@ def _safe_float(value, default_value):
 class CnnCore(nn.Module):
     def __init__(self, hidden_size, family_size, arg_size):
         super().__init__()
-        self.conv1 = nn.Conv1d(CHANNEL_COUNT, 16, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(16, 16, kernel_size=3, padding=1)
-        self.meta_proj = nn.Linear(META_COUNT, 32)
-        self.hidden_fuse = nn.Linear(16 + 32, hidden_size)
+        self.conv1 = nn.Conv1d(CHANNEL_COUNT, 24, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(24, 24, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(24, 24, kernel_size=3, padding=1)
+        self.meta_proj = nn.Linear(META_COUNT, 48)
+        self.hidden_fuse = nn.Linear(24 + 48, hidden_size)
+
+        self.temporal_proj = nn.Linear(TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT, 24)
+        self.post_temporal = nn.Linear(hidden_size + 24, hidden_size)
+
         self.belief_head = nn.Linear(hidden_size, TILE_COUNT)
         self.belief_proj = nn.Linear(TILE_COUNT, 16)
         self.output_fuse = nn.Linear(hidden_size + 16, hidden_size)
+
         self.family_head = nn.Linear(hidden_size, family_size)
-        self.arg1_head = nn.Linear(hidden_size, arg_size)
-        self.arg2_head = nn.Linear(hidden_size, arg_size)
+        self.family_embedding = nn.Embedding(family_size, hidden_size)
+
+        self.arg1_head = nn.Linear(hidden_size * 2, arg_size)
+        self.arg2_head = nn.Linear(hidden_size * 2, arg_size)
+
+        self.value_hidden = nn.Linear(hidden_size, hidden_size)
         self.value_head = nn.Linear(hidden_size, 1)
+        self.aux_value_head = nn.Linear(hidden_size, 1)
+        self.efficiency_bonus_head = nn.Linear(hidden_size, 1)
 
     def forward(self, tile_tensor, meta_tensor):
         tile_features = F.relu(self.conv1(tile_tensor))
         tile_features = F.relu(self.conv2(tile_features))
+        tile_features = F.relu(self.conv3(tile_features))
         tile_features = F.adaptive_avg_pool1d(tile_features, 1).squeeze(-1)
 
         meta_features = F.relu(self.meta_proj(meta_tensor))
         hidden = F.relu(self.hidden_fuse(torch.cat([tile_features, meta_features], dim=-1)))
+
+        temporal_width = TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT
+        temporal_slice = meta_tensor[:, -temporal_width:]
+        temporal_features = F.relu(self.temporal_proj(temporal_slice))
+        hidden = F.relu(self.post_temporal(torch.cat([hidden, temporal_features], dim=-1)))
+
         belief_logits = self.belief_head(hidden)
         belief_probs = torch.softmax(belief_logits, dim=-1)
         belief_context = F.relu(self.belief_proj(belief_probs))
         hidden = F.relu(self.output_fuse(torch.cat([hidden, belief_context], dim=-1)))
+
+        value_hidden = F.relu(self.value_hidden(hidden))
 
         return {
             'hidden': hidden,
             'belief_logits': belief_logits,
             'belief_probs': belief_probs,
             'family_logits': self.family_head(hidden),
-            'arg1_logits': self.arg1_head(hidden),
-            'arg2_logits': self.arg2_head(hidden),
-            'value': self.value_head(hidden),
+            'value': self.value_head(value_hidden),
+            'aux_value': self.aux_value_head(value_hidden),
+            'efficiency_bonus': self.efficiency_bonus_head(hidden),
         }
+
+    def conditioned_arg_logits(self, hidden, family_indices):
+        family_embed = self.family_embedding(family_indices)
+        conditioned = torch.cat([hidden, family_embed], dim=-1)
+        return self.arg1_head(conditioned), self.arg2_head(conditioned)
 
 
 class CnnPolicyValueModel:
@@ -124,6 +154,8 @@ class CnnPolicyValueModel:
         self.device = torch.device('cpu')
         torch.manual_seed(self.seed)
 
+        self.calibration_temperature = max(1e-3, _safe_float(self.metadata.get('calibration_temperature', 1.0), 1.0))
+
         self.model = CnnCore(
             hidden_size=self.hidden_size,
             family_size=len(self.family_vocab),
@@ -137,9 +169,6 @@ class CnnPolicyValueModel:
     def _zero_tile_tensor(self):
         return torch.zeros((CHANNEL_COUNT, TILE_COUNT), dtype=torch.float32, device=self.device)
 
-    def _zero_meta_tensor(self):
-        return torch.zeros((META_COUNT,), dtype=torch.float32, device=self.device)
-
     def _channel_tensor(self, values):
         tensor = torch.zeros((TILE_COUNT,), dtype=torch.float32, device=self.device)
         if isinstance(values, list):
@@ -148,25 +177,70 @@ class CnnPolicyValueModel:
                 tensor[:limit] = torch.tensor(values[:limit], dtype=torch.float32, device=self.device)
         return tensor
 
+    def _one_hot(self, value, vocabulary):
+        vector = [0.0] * len(vocabulary)
+        try:
+            index = vocabulary.index(value)
+        except ValueError:
+            index = 0
+        vector[index] = 1.0
+        return vector
+
+    def _safe_ratio(self, value, divisor):
+        divisor = float(divisor)
+        if divisor <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, float(value) / divisor))
+
+    def _extract_temporal_meta(self, features):
+        temporal = []
+        temporal_payload = features.get('opponent_temporal') if isinstance(features, dict) else None
+        if not isinstance(temporal_payload, list):
+            temporal_payload = []
+
+        for row in temporal_payload[:TEMPORAL_OPPONENT_COUNT]:
+            if not isinstance(row, dict):
+                row = {}
+            suits = row.get('suit_ratios', {}) if isinstance(row.get('suit_ratios', {}), dict) else {}
+            temporal.extend(
+                [
+                    self._safe_ratio(row.get('full_history_length', 0.0), 40.0),
+                    self._safe_ratio(row.get('pack_count', 0.0), 4.0),
+                    _safe_float(row.get('recent_honor_ratio', 0.0), 0.0),
+                    _safe_float(row.get('honor_ratio', 0.0), 0.0),
+                    _safe_float(suits.get('W', 0.0), 0.0),
+                    _safe_float(suits.get('B', 0.0), 0.0),
+                    _safe_float(suits.get('T', 0.0), 0.0),
+                ]
+            )
+
+        while len(temporal) < TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT:
+            temporal.append(0.0)
+        return temporal[: TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT]
+
     def _encode_features(self, features):
         if not isinstance(features, dict):
             features = {}
 
         tile_tensor = self._zero_tile_tensor()
-        channel_keys = [
-            'hand_counts',
-            'seen_counts',
-            'self_discard_counts',
-            'pack_counts',
-        ]
 
-        for channel_index, key in enumerate(channel_keys):
-            tile_tensor[channel_index] = self._channel_tensor(features.get(key))
+        tile_tensor[0] = self._channel_tensor(features.get('hand_counts_norm', features.get('hand_counts', [])))
+        tile_tensor[1] = self._channel_tensor(features.get('seen_counts_norm', features.get('seen_counts', [])))
+        tile_tensor[2] = self._channel_tensor(features.get('self_discard_counts_norm', features.get('self_discard_counts', [])))
+        tile_tensor[3] = self._channel_tensor(features.get('pack_counts_norm', features.get('pack_counts', [])))
 
-        opponent_channels = features.get('opponent_discard_counts')
+        opponent_channels = features.get('opponent_discard_counts_norm', features.get('opponent_discard_counts', []))
         if isinstance(opponent_channels, list):
             for offset, channel in enumerate(opponent_channels[:3], start=4):
                 tile_tensor[offset] = self._channel_tensor(channel if isinstance(channel, list) else [])
+
+        tile_tensor[7] = self._channel_tensor(features.get('hand_counts', []))
+        tile_tensor[8] = self._channel_tensor(features.get('seen_counts', []))
+
+        shanten_norm = _safe_float(features.get('hand_shanten_norm', 0.0), 0.0)
+        acceptancy_norm = _safe_float(features.get('acceptancy_norm', 0.0), 0.0)
+        tile_tensor[9] = torch.full((TILE_COUNT,), shanten_norm, dtype=torch.float32, device=self.device)
+        tile_tensor[10] = torch.full((TILE_COUNT,), acceptancy_norm, dtype=torch.float32, device=self.device)
 
         meta_values = []
         meta = features.get('meta')
@@ -178,6 +252,7 @@ class CnnPolicyValueModel:
         request_type = _safe_int(features.get('request_type', 0), 0)
         seat = _safe_int(features.get('seat', features.get('player_id', -1)), -1)
         target_player = 1.0 if features.get('target_player') else 0.0
+
         event_action = features.get('event_action')
         raw_request = features.get('raw_request')
 
@@ -185,17 +260,22 @@ class CnnPolicyValueModel:
         meta_values.extend(self._one_hot(event_action, EVENT_VOCAB))
         meta_values.extend(self._one_hot(raw_request, REQUEST_VOCAB))
 
-        meta_tensor = torch.tensor(meta_values, dtype=torch.float32, device=self.device)
-        return tile_tensor.unsqueeze(0), meta_tensor.unsqueeze(0)
+        meta_values.extend(
+            [
+                _safe_float(features.get('schema_version', 0.0), 0.0),
+                _safe_float(features.get('hand_shanten_norm', 0.0), 0.0),
+                _safe_float(features.get('acceptancy_norm', 0.0), 0.0),
+                _safe_float((features.get('action_efficiency_deltas') or {}).get('PLAY', 0.0), 0.0),
+                _safe_float((features.get('action_efficiency_deltas') or {}).get('GANG', 0.0), 0.0),
+            ]
+        )
+        meta_values.extend(self._extract_temporal_meta(features))
 
-    def _one_hot(self, value, vocabulary):
-        vector = [0.0] * len(vocabulary)
-        try:
-            index = vocabulary.index(value)
-        except ValueError:
-            index = 0
-        vector[index] = 1.0
-        return vector
+        while len(meta_values) < META_COUNT:
+            meta_values.append(0.0)
+
+        meta_tensor = torch.tensor(meta_values[:META_COUNT], dtype=torch.float32, device=self.device)
+        return tile_tensor.unsqueeze(0), meta_tensor.unsqueeze(0)
 
     def _belief_target_from_features(self, features):
         seen_counts = features.get('seen_counts') if isinstance(features, dict) else None
@@ -227,11 +307,21 @@ class CnnPolicyValueModel:
         family = parts[0] if parts else 'PASS'
         arg1 = parts[1] if len(parts) > 1 else NONE_TOKEN
         arg2 = parts[2] if len(parts) > 2 else NONE_TOKEN
-        return self.family_index.get(family, 0), self.arg_index.get(arg1, self.arg_index[NONE_TOKEN]), self.arg_index.get(arg2, self.arg_index[NONE_TOKEN])
+        return (
+            self.family_index.get(family, 0),
+            self.arg_index.get(arg1, self.arg_index[NONE_TOKEN]),
+            self.arg_index.get(arg2, self.arg_index[NONE_TOKEN]),
+        )
+
+    def _conditioned_arg_logits(self, outputs, family_index):
+        family_tensor = torch.tensor([int(family_index)], dtype=torch.long, device=self.device)
+        return self.model.conditioned_arg_logits(outputs['hidden'], family_tensor)
 
     def _action_score(self, outputs, action):
         family_index, arg1_index, arg2_index = self._action_indices(action)
-        return outputs['family_logits'][0, family_index] + outputs['arg1_logits'][0, arg1_index] + outputs['arg2_logits'][0, arg2_index]
+        arg1_logits, arg2_logits = self._conditioned_arg_logits(outputs, family_index)
+        score = outputs['family_logits'][0, family_index] + arg1_logits[0, arg1_index] + arg2_logits[0, arg2_index]
+        return score
 
     def _belief_bonus(self, outputs, action):
         if 'PLAY ' not in action and 'GANG ' not in action and 'BUGANG ' not in action:
@@ -246,16 +336,38 @@ class CnnPolicyValueModel:
             return 0.0
         return float(belief_probs[0, tile_index].item())
 
-    def _legal_action_scores(self, outputs, legal_actions, belief_weight=0.0):
+    def _efficiency_prior(self, features, action):
+        if not isinstance(features, dict):
+            return 0.0
+        deltas = features.get('action_efficiency_deltas', {})
+        if not isinstance(deltas, dict):
+            return 0.0
+        family = action.split()[0] if action else 'PASS'
+        return _safe_float(deltas.get(family, 0.0), 0.0)
+
+    def _legal_action_scores(self, outputs, legal_actions, features=None, belief_weight=0.0, efficiency_weight=0.0):
         scores = []
+        efficiency_bonus = _safe_float(outputs.get('efficiency_bonus', torch.tensor([[0.0]])).item(), 0.0)
         for action in legal_actions:
             score = self._action_score(outputs, action)
             if belief_weight:
                 score = score + float(belief_weight) * self._belief_bonus(outputs, action)
+            if efficiency_weight:
+                score = score + float(efficiency_weight) * efficiency_bonus * self._efficiency_prior(features, action)
             scores.append(score)
         return torch.stack(scores, dim=0)
 
-    def policy_info_from_features(self, features, legal_actions, belief_weight=0.0):
+    def set_calibration_temperature(self, temperature):
+        self.calibration_temperature = max(1e-3, _safe_float(temperature, 1.0))
+        self.metadata['calibration_temperature'] = float(self.calibration_temperature)
+
+    def _temperature_adjusted_scores(self, scores, temperature=None):
+        if temperature is None:
+            temperature = self.calibration_temperature
+        temperature = max(1e-3, _safe_float(temperature, 1.0))
+        return scores / temperature
+
+    def policy_info_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
         if not legal_actions:
             return {
                 'actions': [],
@@ -266,17 +378,28 @@ class CnnPolicyValueModel:
                 'belief_entropy': 0.0,
                 'entropy': 0.0,
                 'value': 0.0,
+                'aux_value': 0.0,
+                'efficiency_bonus': 0.0,
             }
 
         self.model.eval()
         with torch.no_grad():
             tile_tensor, meta_tensor = self._encode_features(features)
             outputs = self.model(tile_tensor, meta_tensor)
-            scores = self._legal_action_scores(outputs, legal_actions, belief_weight=belief_weight)
+            raw_scores = self._legal_action_scores(
+                outputs,
+                legal_actions,
+                features=features,
+                belief_weight=belief_weight,
+                efficiency_weight=efficiency_weight,
+            )
+            scores = self._temperature_adjusted_scores(raw_scores, temperature=temperature)
             log_probabilities = torch.log_softmax(scores, dim=0)
             probabilities = torch.softmax(scores, dim=0)
             entropy = float((-(probabilities * log_probabilities)).sum().item())
             value = float(outputs['value'][0, 0].item())
+            aux_value = float(outputs['aux_value'][0, 0].item())
+            efficiency_bonus = float(outputs['efficiency_bonus'][0, 0].item())
             belief_probs = outputs.get('belief_probs')
             if belief_probs is None:
                 belief_list = []
@@ -294,10 +417,18 @@ class CnnPolicyValueModel:
             'belief_entropy': belief_entropy,
             'entropy': entropy,
             'value': value,
+            'aux_value': aux_value,
+            'efficiency_bonus': efficiency_bonus,
         }
 
-    def sample_action_from_features(self, features, legal_actions, temperature=1.0, greedy=False, belief_weight=0.0):
-        info = self.policy_info_from_features(features, legal_actions, belief_weight=belief_weight)
+    def sample_action_from_features(self, features, legal_actions, temperature=1.0, greedy=False, belief_weight=0.0, efficiency_weight=0.0):
+        info = self.policy_info_from_features(
+            features,
+            legal_actions,
+            belief_weight=belief_weight,
+            efficiency_weight=efficiency_weight,
+            temperature=temperature,
+        )
         actions = info['actions']
         if not actions:
             return None, info
@@ -306,8 +437,8 @@ class CnnPolicyValueModel:
             index = max(range(len(actions)), key=lambda idx: (info['probabilities'][idx], actions[idx]))
         else:
             probabilities = torch.tensor(info['probabilities'], dtype=torch.float32, device=self.device)
-            if temperature and float(temperature) != 1.0:
-                logits = torch.log(torch.clamp(probabilities, min=1e-12)) / float(temperature)
+            if float(temperature) != 1.0:
+                logits = torch.log(torch.clamp(probabilities, min=1e-12)) / max(1e-3, float(temperature))
                 probabilities = torch.softmax(logits, dim=0)
             index = int(torch.multinomial(probabilities, 1).item())
 
@@ -321,21 +452,65 @@ class CnnPolicyValueModel:
         info['selected_probability'] = float(selected_probability)
         return selected_action, info
 
-    def action_distribution_from_features(self, features, legal_actions, belief_weight=0.0):
-        if not legal_actions:
-            return {}
+    def action_distribution_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
+        info = self.policy_info_from_features(
+            features,
+            legal_actions,
+            belief_weight=belief_weight,
+            efficiency_weight=efficiency_weight,
+            temperature=temperature,
+        )
+        return {action: probability for action, probability in zip(info['actions'], info['probabilities'])}
 
+    def decode_conditioned_action_from_features(self, features, legal_actions=None, deterministic=True, temperature=1.0):
         self.model.eval()
         with torch.no_grad():
             tile_tensor, meta_tensor = self._encode_features(features)
             outputs = self.model(tile_tensor, meta_tensor)
-            scores = self._legal_action_scores(outputs, legal_actions, belief_weight=belief_weight)
-            probabilities = torch.softmax(scores, dim=0)
+            family_logits = outputs['family_logits'][0]
+            if deterministic:
+                family_index = int(torch.argmax(family_logits).item())
+            else:
+                family_probs = torch.softmax(family_logits / max(1e-3, float(temperature)), dim=0)
+                family_index = int(torch.multinomial(family_probs, 1).item())
 
-        return {action: float(probability.item()) for action, probability in zip(legal_actions, probabilities)}
+            arg1_logits, arg2_logits = self._conditioned_arg_logits(outputs, family_index)
+            arg1_index = int(torch.argmax(arg1_logits[0]).item())
+            arg2_index = int(torch.argmax(arg2_logits[0]).item())
 
-    def choose_action_from_features(self, features, legal_actions, belief_weight=0.0):
-        distribution = self.action_distribution_from_features(features, legal_actions, belief_weight=belief_weight)
+            family = self.family_vocab[family_index]
+            arg1 = self.arg_vocab[arg1_index]
+            arg2 = self.arg_vocab[arg2_index]
+
+            if family in ('PASS', 'HU'):
+                candidate = family
+            elif family == 'GANG' and arg1 == NONE_TOKEN:
+                candidate = 'GANG'
+            elif family in ('PLAY', 'GANG', 'BUGANG', 'PENG'):
+                candidate = '%s %s' % (family, arg1)
+            elif family == 'CHI':
+                candidate = '%s %s %s' % (family, arg1, arg2)
+            else:
+                candidate = 'PASS'
+
+            if legal_actions:
+                if candidate in legal_actions:
+                    return candidate
+                info = self.policy_info_from_features(features, legal_actions)
+                if info['actions']:
+                    best_idx = max(range(len(info['actions'])), key=lambda idx: info['probabilities'][idx])
+                    return info['actions'][best_idx]
+                return None
+            return candidate
+
+    def choose_action_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
+        distribution = self.action_distribution_from_features(
+            features,
+            legal_actions,
+            belief_weight=belief_weight,
+            efficiency_weight=efficiency_weight,
+            temperature=temperature,
+        )
         if not distribution:
             return None
         ranked = sorted(distribution.items(), key=lambda item: (-item[1], item[0]))
@@ -348,7 +523,37 @@ class CnnPolicyValueModel:
             outputs = self.model(tile_tensor, meta_tensor)
             return float(outputs['value'][0, 0].item())
 
-    def train_step(self, features, legal_actions, action, reward, policy_weight=1.0, value_weight=0.5, belief_weight=0.25):
+    def _belief_consistency_penalty(self, outputs, features):
+        if not isinstance(features, dict):
+            return torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        seen = features.get('seen_counts', [])
+        if not isinstance(seen, list) or not seen:
+            return torch.tensor(0.0, dtype=torch.float32, device=self.device)
+
+        indices = []
+        for idx, count in enumerate(seen[:TILE_COUNT]):
+            if _safe_float(count, 0.0) >= 4.0:
+                indices.append(idx)
+
+        if not indices:
+            return torch.tensor(0.0, dtype=torch.float32, device=self.device)
+
+        probs = outputs['belief_probs'][0, indices]
+        return probs.mean()
+
+    def train_step(
+        self,
+        features,
+        legal_actions,
+        action,
+        reward,
+        policy_weight=1.0,
+        value_weight=0.5,
+        belief_weight=0.25,
+        aux_value_weight=0.15,
+        efficiency_weight=0.1,
+        belief_consistency_weight=0.1,
+    ):
         if not legal_actions:
             legal_actions = [action]
         if action not in legal_actions:
@@ -360,16 +565,26 @@ class CnnPolicyValueModel:
         tile_tensor, meta_tensor = self._encode_features(features)
         outputs = self.model(tile_tensor, meta_tensor)
 
-        scores = torch.stack([self._action_score(outputs, candidate) for candidate in legal_actions], dim=0).unsqueeze(0)
+        scores = self._legal_action_scores(outputs, legal_actions, features=features, belief_weight=0.0, efficiency_weight=efficiency_weight).unsqueeze(0)
         target_index = torch.tensor([legal_actions.index(action)], dtype=torch.long, device=self.device)
         action_loss = F.cross_entropy(scores, target_index)
 
         value_target = torch.tensor([[float(_safe_float(reward, 0.0))]], dtype=torch.float32, device=self.device)
         value_loss = F.mse_loss(outputs['value'], value_target)
+        aux_target = torch.tanh(value_target)
+        aux_value_loss = F.mse_loss(outputs['aux_value'], aux_target)
+
         belief_target = torch.tensor([self._belief_target_from_features(features)], dtype=torch.float32, device=self.device)
         belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
+        belief_consistency_loss = self._belief_consistency_penalty(outputs, features)
 
-        loss = float(policy_weight) * action_loss + float(value_weight) * value_loss + float(belief_weight) * belief_loss
+        loss = (
+            float(policy_weight) * action_loss
+            + float(value_weight) * value_loss
+            + float(aux_value_weight) * aux_value_loss
+            + float(belief_weight) * belief_loss
+            + float(belief_consistency_weight) * belief_consistency_loss
+        )
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -381,11 +596,14 @@ class CnnPolicyValueModel:
         return {
             'action_loss': float(action_loss.item()),
             'value_loss': float(value_loss.item()),
+            'aux_value_loss': float(aux_value_loss.item()),
             'belief_loss': float(belief_loss.item()),
+            'belief_consistency_loss': float(belief_consistency_loss.item()),
             'weighted_total_loss': float(loss.item()),
             'action_hit': action_hit,
             'is_decision_state': bool(is_decision_state),
             'legal_action_count': int(legal_action_count),
+            'efficiency_bonus': float(outputs['efficiency_bonus'][0, 0].detach().item()),
         }
 
     def ppo_train_step(self, features, legal_actions, action, advantage, return_target, old_log_prob=None, clip_range=0.2, entropy_coef=0.01, value_coef=0.5, belief_coef=0.25):
@@ -398,7 +616,7 @@ class CnnPolicyValueModel:
         tile_tensor, meta_tensor = self._encode_features(features)
         outputs = self.model(tile_tensor, meta_tensor)
 
-        scores = self._legal_action_scores(outputs, legal_actions)
+        scores = self._legal_action_scores(outputs, legal_actions, features=features)
         log_probabilities = torch.log_softmax(scores, dim=0)
         probabilities = torch.softmax(scores, dim=0)
         action_index = legal_actions.index(action)
@@ -443,11 +661,18 @@ class CnnPolicyValueModel:
         value_weight=0.5,
         belief_weight=0.25,
         forced_policy_weight=0.0,
+        aux_value_weight=0.15,
+        efficiency_weight=0.1,
+        belief_consistency_weight=0.1,
     ):
         stats = {
             'samples': 0,
             'action_loss': 0.0,
             'value_loss': 0.0,
+            'aux_value_loss': 0.0,
+            'belief_loss': 0.0,
+            'belief_consistency_loss': 0.0,
+            'efficiency_bonus': 0.0,
             'action_hits': 0,
             'weighted_total_loss': 0.0,
             'decision_samples': 0,
@@ -458,15 +683,6 @@ class CnnPolicyValueModel:
 
         epoch_count = int(epochs)
         for epoch_index in range(epoch_count):
-            epoch_samples = 0
-            epoch_action_loss = 0.0
-            epoch_value_loss = 0.0
-            epoch_action_hits = 0
-            epoch_weighted_total_loss = 0.0
-            epoch_decision_samples = 0
-            epoch_decision_hits = 0
-            epoch_forced_samples = 0
-
             if shuffle:
                 record_list = list(records)
                 order = torch.randperm(len(record_list), generator=torch.Generator().manual_seed(self.seed + epoch_index)).tolist()
@@ -476,31 +692,6 @@ class CnnPolicyValueModel:
 
             for record in iterable:
                 if limit is not None and stats['samples'] >= limit:
-                    if verbose and epoch_samples > 0:
-                        epoch_accuracy = float(epoch_action_hits) / float(epoch_samples)
-                        epoch_forced_rate = float(epoch_forced_samples) / float(epoch_samples)
-                        if epoch_decision_samples > 0:
-                            epoch_decision_accuracy = float(epoch_decision_hits) / float(epoch_decision_samples)
-                            decision_segment = ' decision_accuracy=%.6f decision_samples=%d' % (
-                                epoch_decision_accuracy,
-                                epoch_decision_samples,
-                            )
-                        else:
-                            decision_segment = ' decision_accuracy=n/a decision_samples=0'
-                        print(
-                            'epoch %d/%d samples=%d action_loss=%.6f value_loss=%.6f weighted_total_loss=%.6f action_accuracy=%.6f forced_rate=%.6f%s'
-                            % (
-                                epoch_index + 1,
-                                epoch_count,
-                                epoch_samples,
-                                epoch_action_loss / float(epoch_samples),
-                                epoch_value_loss / float(epoch_samples),
-                                epoch_weighted_total_loss / float(epoch_samples),
-                                epoch_accuracy,
-                                epoch_forced_rate,
-                                decision_segment,
-                            )
-                        )
                     return stats
                 legal_actions = list(record.legal_actions or [])
                 if record.action not in legal_actions:
@@ -515,10 +706,17 @@ class CnnPolicyValueModel:
                     policy_weight=record_policy_weight,
                     value_weight=value_weight,
                     belief_weight=belief_weight,
+                    aux_value_weight=aux_value_weight,
+                    efficiency_weight=efficiency_weight,
+                    belief_consistency_weight=belief_consistency_weight,
                 )
                 stats['samples'] += 1
                 stats['action_loss'] += result['action_loss']
                 stats['value_loss'] += result['value_loss']
+                stats['aux_value_loss'] += result.get('aux_value_loss', 0.0)
+                stats['belief_loss'] += result.get('belief_loss', 0.0)
+                stats['belief_consistency_loss'] += result.get('belief_consistency_loss', 0.0)
+                stats['efficiency_bonus'] += result.get('efficiency_bonus', 0.0)
                 stats['action_hits'] += result['action_hit']
                 stats['weighted_total_loss'] += result.get('weighted_total_loss', 0.0)
                 if result.get('is_decision_state'):
@@ -526,40 +724,19 @@ class CnnPolicyValueModel:
                     stats['decision_hits'] += result['action_hit']
                 else:
                     stats['forced_samples'] += 1
-                epoch_samples += 1
-                epoch_action_loss += result['action_loss']
-                epoch_value_loss += result['value_loss']
-                epoch_action_hits += result['action_hit']
-                epoch_weighted_total_loss += result.get('weighted_total_loss', 0.0)
-                if result.get('is_decision_state'):
-                    epoch_decision_samples += 1
-                    epoch_decision_hits += result['action_hit']
-                else:
-                    epoch_forced_samples += 1
 
-            if verbose and epoch_samples > 0:
-                epoch_accuracy = float(epoch_action_hits) / float(epoch_samples)
-                epoch_forced_rate = float(epoch_forced_samples) / float(epoch_samples)
-                if epoch_decision_samples > 0:
-                    epoch_decision_accuracy = float(epoch_decision_hits) / float(epoch_decision_samples)
-                    decision_segment = ' decision_accuracy=%.6f decision_samples=%d' % (
-                        epoch_decision_accuracy,
-                        epoch_decision_samples,
-                    )
-                else:
-                    decision_segment = ' decision_accuracy=n/a decision_samples=0'
+            if verbose and stats['samples'] > 0:
+                samples = float(stats['samples'])
                 print(
-                    'epoch %d/%d samples=%d action_loss=%.6f value_loss=%.6f weighted_total_loss=%.6f action_accuracy=%.6f forced_rate=%.6f%s'
+                    'epoch %d/%d samples=%d action_loss=%.6f value_loss=%.6f weighted_total_loss=%.6f action_accuracy=%.6f'
                     % (
                         epoch_index + 1,
                         epoch_count,
-                        epoch_samples,
-                        epoch_action_loss / float(epoch_samples),
-                        epoch_value_loss / float(epoch_samples),
-                        epoch_weighted_total_loss / float(epoch_samples),
-                        epoch_accuracy,
-                        epoch_forced_rate,
-                        decision_segment,
+                        stats['samples'],
+                        stats['action_loss'] / samples,
+                        stats['value_loss'] / samples,
+                        stats['weighted_total_loss'] / samples,
+                        float(stats['action_hits']) / samples,
                     )
                 )
 

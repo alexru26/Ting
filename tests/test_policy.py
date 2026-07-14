@@ -76,7 +76,7 @@ class _AdaptiveStubModel:
         self.belief_entropy = belief_entropy
         self.last_belief_weight = None
 
-    def policy_info_from_features(self, features, legal_actions, belief_weight=0.0):
+    def policy_info_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
         self.last_belief_weight = belief_weight
         return {
             'actions': list(legal_actions),
@@ -89,7 +89,7 @@ class _AdaptiveStubModel:
             'value': 0.0,
         }
 
-    def choose_action_from_features(self, features, legal_actions, belief_weight=0.0):
+    def choose_action_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
         self.last_belief_weight = belief_weight
         if belief_weight > 0.1 and 'PLAY W1' in legal_actions:
             return 'PLAY W1'
@@ -100,7 +100,7 @@ class _SearchStubModel:
     def __init__(self):
         self.last_belief_weight = None
 
-    def policy_info_from_features(self, features, legal_actions, belief_weight=0.0):
+    def policy_info_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
         self.last_belief_weight = belief_weight
         scores = []
         for action in legal_actions:
@@ -131,7 +131,7 @@ class _SearchStubModel:
             return 0.25
         return 0.1
 
-    def choose_action_from_features(self, features, legal_actions, belief_weight=0.0):
+    def choose_action_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
         return 'PLAY W2' if 'PLAY W2' in legal_actions else legal_actions[0]
 
 

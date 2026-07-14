@@ -22,10 +22,16 @@ def load_policy_model(path):
     return CnnPolicyValueModel.from_dict(payload)
 
 
-def choose_action_from_model(model, features, legal_actions, codec=None, belief_weight=0.0):
+def choose_action_from_model(model, features, legal_actions, codec=None, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
     if hasattr(model, 'choose_action_from_features'):
         try:
-            return model.choose_action_from_features(features, legal_actions, belief_weight=belief_weight)
+            return model.choose_action_from_features(
+                features,
+                legal_actions,
+                belief_weight=belief_weight,
+                efficiency_weight=efficiency_weight,
+                temperature=temperature,
+            )
         except TypeError:
             try:
                 return model.choose_action_from_features(features, legal_actions)

@@ -114,13 +114,14 @@ def _hidden_risk(action, hidden_tiles):
 
 
 class BoundedRolloutPlanner:
-    def __init__(self, model, top_k=3, rollout_samples=8, budget_ms=10, disabled=False, belief_weight=0.5, seed=7):
+    def __init__(self, model, top_k=3, rollout_samples=8, budget_ms=10, disabled=False, belief_weight=0.5, efficiency_weight=0.2, seed=7):
         self.model = model
         self.top_k = max(1, _safe_int(top_k, 3))
         self.rollout_samples = max(0, _safe_int(rollout_samples, 8))
         self.budget_ms = max(0, _safe_int(budget_ms, 10))
         self.disabled = bool(disabled)
         self.belief_weight = max(0.0, _safe_float(belief_weight, 0.5))
+        self.efficiency_weight = max(0.0, _safe_float(efficiency_weight, 0.2))
         self.seed = _safe_int(seed, 7)
 
     def enabled(self):
@@ -152,9 +153,13 @@ class BoundedRolloutPlanner:
                 break
 
             projected_features = project_features_for_action(features, action)
-            leaf_value = _safe_float(self.model.estimate_value_from_features(projected_features), 0.0)
+            info = self.model.policy_info_from_features(projected_features, [action], belief_weight=0.0)
+            leaf_value = _safe_float(info.get('value', self.model.estimate_value_from_features(projected_features)), 0.0)
+            efficiency_bonus = _safe_float(info.get('efficiency_bonus', 0.0), 0.0)
             risk_penalty = _hidden_risk(action, hidden_tiles)
-            score = leaf_value - self.belief_weight * risk_penalty
+
+            risk_weight = self.belief_weight if belief_weight <= 0.0 else max(self.belief_weight, _safe_float(belief_weight, 0.0))
+            score = leaf_value + self.efficiency_weight * efficiency_bonus - risk_weight * risk_penalty
             if best_score is None or score > best_score or (score == best_score and action < best_action):
                 best_action = action
                 best_score = score
