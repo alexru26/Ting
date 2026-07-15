@@ -15,6 +15,7 @@ from imitation import (
     choose_action_from_model,
     evaluate_cnn,
     load_policy_model,
+    preencode_cnn,
     train_cnn,
 )
 from policy import NeuralPolicy
@@ -330,6 +331,33 @@ class TestImitationNeuralOnly(unittest.TestCase):
             self.assertFalse(metadata['decision_only'])
             self.assertTrue(metadata['decision_only_fallback_used'])
             self.assertGreater(train_result['training_stats']['samples'], 0)
+
+    def test_preencode_cache_and_cache_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = os.path.join(tmp, 'train.jsonl')
+            model_path = os.path.join(tmp, 'model.h5')
+            cache_path = os.path.join(tmp, 'cache.npz')
+            self._write_dataset(dataset_path)
+
+            summary = preencode_cnn(
+                dataset_path=dataset_path,
+                cache_out_path=cache_path,
+                max_records=None,
+                decision_only=False,
+                verbose=False,
+            )
+            self.assertTrue(os.path.exists(cache_path))
+            self.assertGreaterEqual(summary['record_count'], 3)
+
+            result = train_cnn(
+                dataset_path=dataset_path,
+                model_out_path=model_path,
+                epochs=1,
+                cache_path=cache_path,
+                batch_size=2,
+            )
+            self.assertTrue(os.path.exists(model_path))
+            self.assertTrue(result['metadata']['using_preencoded_cache'])
 
 
 if __name__ == '__main__':

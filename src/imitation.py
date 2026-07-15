@@ -5,6 +5,8 @@ import os
 import random
 import time
 
+import numpy as np
+
 from action_codec import ActionCodec
 from dataset import JsonlTrajectoryReader, create_mixed_split_manifest, ingest_external_jsonl
 from model import CnnPolicyValueModel
@@ -256,6 +258,117 @@ def _merge_training_stats(accumulated, delta):
     return merged
 
 
+def _split_index_array(total_count, train_ratio=0.8, seed=7):
+    indices = np.arange(int(total_count), dtype=np.int64)
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(indices)
+    split_index = int(float(train_ratio) * float(total_count))
+    if total_count > 1:
+        split_index = max(1, min(split_index, total_count - 1))
+    else:
+        split_index = 1
+    return indices[:split_index], indices[split_index:]
+
+
+def _slice_preencoded(preencoded, indices):
+    idx = np.asarray(indices, dtype=np.int64)
+    return {
+        'tile_tensor': preencoded['tile_tensor'][idx],
+        'meta_tensor': preencoded['meta_tensor'][idx],
+        'family_target': preencoded['family_target'][idx],
+        'arg1_target': preencoded['arg1_target'][idx],
+        'arg2_target': preencoded['arg2_target'][idx],
+        'reward': preencoded['reward'][idx],
+        'decision_mask': preencoded['decision_mask'][idx],
+        'belief_target': preencoded['belief_target'][idx],
+        'seen_full_mask': preencoded['seen_full_mask'][idx],
+    }
+
+
+def preencode_cnn(dataset_path, cache_out_path, max_records=None, decision_only=False, device='cpu', verbose=False):
+    start = time.perf_counter()
+    codec = ActionCodec()
+    model = CnnPolicyValueModel(action_space_size=codec.size, hidden_size=32, learning_rate=0.001, device=device)
+
+    records, dropped_forced = _collect_training_records(
+        dataset_path,
+        max_records=max_records,
+        decision_only=decision_only,
+    )
+    if not records:
+        raise ValueError('No records available to pre-encode.')
+
+    if verbose:
+        print('preencode starting records=%d decision_only=%s' % (len(records), str(bool(decision_only))))
+
+    tile_rows = []
+    meta_rows = []
+    family_targets = []
+    arg1_targets = []
+    arg2_targets = []
+    rewards = []
+    decision_mask = []
+    belief_rows = []
+    seen_mask_rows = []
+
+    for idx, record in enumerate(records):
+        legal_actions = list(record.legal_actions or [])
+        if record.action not in legal_actions:
+            legal_actions.append(record.action)
+        is_decision = len(legal_actions) > 1
+
+        tile_tensor, meta_tensor = model._encode_features(record.features)
+        tile_rows.append(tile_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False))
+        meta_rows.append(meta_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False))
+
+        family_idx, arg1_idx, arg2_idx = model.encode_action_targets(record.action)
+        family_targets.append(family_idx)
+        arg1_targets.append(arg1_idx)
+        arg2_targets.append(arg2_idx)
+        rewards.append(float(_safe_float(record.reward, 0.0)))
+        decision_mask.append(1 if is_decision else 0)
+        belief_rows.append(np.asarray(model._belief_target_from_features(record.features), dtype=np.float32))
+
+        seen = record.features.get('seen_counts', []) if isinstance(record.features, dict) else []
+        seen_vec = np.zeros((len(model.arg_vocab) - 1,), dtype=np.float32)
+        if isinstance(seen, list):
+            limit = min(len(seen), seen_vec.shape[0])
+            if limit > 0:
+                seen_slice = np.asarray(seen[:limit], dtype=np.float32)
+                seen_vec[:limit] = (seen_slice >= 4.0).astype(np.float32)
+        seen_mask_rows.append(seen_vec)
+
+        if verbose and ((idx + 1) == 1 or (idx + 1) % 200000 == 0):
+            print('preencode processed=%d/%d' % (idx + 1, len(records)))
+
+    cache_dir = os.path.dirname(cache_out_path)
+    if cache_dir and not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+
+    np.savez(
+        cache_out_path,
+        tile_tensor=np.stack(tile_rows, axis=0),
+        meta_tensor=np.stack(meta_rows, axis=0),
+        family_target=np.asarray(family_targets, dtype=np.int64),
+        arg1_target=np.asarray(arg1_targets, dtype=np.int64),
+        arg2_target=np.asarray(arg2_targets, dtype=np.int64),
+        reward=np.asarray(rewards, dtype=np.float32),
+        decision_mask=np.asarray(decision_mask, dtype=np.uint8),
+        belief_target=np.stack(belief_rows, axis=0),
+        seen_full_mask=np.stack(seen_mask_rows, axis=0),
+    )
+
+    summary = {
+        'cache_out_path': cache_out_path,
+        'dataset_path': dataset_path,
+        'record_count': len(records),
+        'dropped_forced_records': int(dropped_forced),
+        'decision_only': bool(decision_only),
+        'elapsed_seconds': float(time.perf_counter() - start),
+    }
+    return summary
+
+
 def train_cnn(
     dataset_path,
     model_out_path,
@@ -278,6 +391,7 @@ def train_cnn(
     early_stopping_patience=2,
     early_stopping_min_delta=0.0,
     batch_size=256,
+    cache_path=None,
 ):
     train_start = time.perf_counter()
 
@@ -302,14 +416,26 @@ def train_cnn(
     requested_decision_only = bool(decision_only)
     effective_decision_only = requested_decision_only
     decision_only_fallback_used = False
+    using_preencoded_cache = bool(cache_path)
 
-    records, dropped_forced = _collect_training_records(
-        dataset_path,
-        max_records=max_records,
-        decision_only=effective_decision_only,
-    )
+    preencoded = None
+    dropped_forced = 0
+    records = []
 
-    if effective_decision_only and not records:
+    if using_preencoded_cache:
+        cache_load_start = time.perf_counter()
+        with np.load(cache_path) as cache:
+            preencoded = {key: cache[key] for key in cache.files}
+        if verbose:
+            print('loaded preencoded cache path=%s records=%d elapsed=%.2fs' % (cache_path, int(len(preencoded['family_target'])), time.perf_counter() - cache_load_start))
+    else:
+        records, dropped_forced = _collect_training_records(
+            dataset_path,
+            max_records=max_records,
+            decision_only=effective_decision_only,
+        )
+
+    if (not using_preencoded_cache) and effective_decision_only and not records:
         decision_only_fallback_used = True
         effective_decision_only = False
         if verbose:
@@ -321,16 +447,34 @@ def train_cnn(
         )
 
     if verbose:
-        prepared_count = len(records) if isinstance(records, list) else 'stream'
+        if using_preencoded_cache:
+            prepared_count = len(preencoded['family_target']) if preencoded is not None else 0
+        else:
+            prepared_count = len(records) if isinstance(records, list) else 'stream'
         print('data preparation done records=%s dropped_forced=%d elapsed=%.2fs' % (str(prepared_count), int(dropped_forced), time.perf_counter() - data_prep_start))
 
     split_start = time.perf_counter()
     split_seed = int(model.seed)
-    train_records, validation_records = _split_records(records, train_ratio=0.8, seed=split_seed)
+    train_records_list = []
+    validation_records_list = []
+    train_preencoded = None
+    validation_preencoded = None
+    if using_preencoded_cache:
+        if preencoded is None:
+            raise ValueError('Cache loading failed: preencoded payload is missing.')
+        train_idx, val_idx = _split_index_array(len(preencoded['family_target']), train_ratio=0.8, seed=split_seed)
+        train_preencoded = _slice_preencoded(preencoded, train_idx)
+        validation_preencoded = _slice_preencoded(preencoded, val_idx)
+        train_count = int(len(train_preencoded['family_target']))
+        val_count = int(len(validation_preencoded['family_target']))
+    else:
+        train_records_list, validation_records_list = _split_records(records, train_ratio=0.8, seed=split_seed)
+        train_count = len(train_records_list)
+        val_count = len(validation_records_list)
     if verbose:
-        print('dataset split done train_records=%d validation_records=%d split=80/20 elapsed=%.2fs' % (len(train_records), len(validation_records), time.perf_counter() - split_start))
+        print('dataset split done train_records=%d validation_records=%d split=80/20 elapsed=%.2fs' % (train_count, val_count, time.perf_counter() - split_start))
 
-    if not train_records:
+    if train_count <= 0:
         raise ValueError('No training records available after split. Check dataset size and filters.')
 
     fit_start = time.perf_counter()
@@ -348,30 +492,52 @@ def train_cnn(
 
     for epoch_idx in range(epoch_total):
         if verbose:
-            print('early-stopping loop epoch %d/%d training_records=%d validation_records=%d' % (epoch_idx + 1, epoch_total, len(train_records), len(validation_records)))
+            print('early-stopping loop epoch %d/%d training_records=%d validation_records=%d' % (epoch_idx + 1, epoch_total, train_count, val_count))
 
-        epoch_stats = model.fit(
-            train_records,
-            epochs=1,
-            max_records=None,
-            shuffle=True,
-            verbose=False,
-            policy_weight=policy_weight,
-            value_weight=value_weight,
-            belief_weight=belief_weight,
-            forced_policy_weight=forced_policy_weight,
-            aux_value_weight=0.15,
-            efficiency_weight=0.0 if ablate_efficiency else 0.1,
-            belief_consistency_weight=0.0 if ablate_belief else 0.1,
-            batch_size=batch_size,
-        )
+        if using_preencoded_cache:
+            if train_preencoded is None:
+                raise ValueError('Training pre-encoded split is missing.')
+            epoch_stats = model.fit_preencoded(
+                train_preencoded,
+                epochs=1,
+                batch_size=batch_size,
+                shuffle=True,
+                verbose=False,
+                policy_weight=policy_weight,
+                value_weight=value_weight,
+                belief_weight=belief_weight,
+                forced_policy_weight=forced_policy_weight,
+                aux_value_weight=0.15,
+                efficiency_weight=0.0 if ablate_efficiency else 0.1,
+                belief_consistency_weight=0.0 if ablate_belief else 0.1,
+            )
+        else:
+            epoch_stats = model.fit(
+                train_records_list,
+                epochs=1,
+                max_records=None,
+                shuffle=True,
+                verbose=False,
+                policy_weight=policy_weight,
+                value_weight=value_weight,
+                belief_weight=belief_weight,
+                forced_policy_weight=forced_policy_weight,
+                aux_value_weight=0.15,
+                efficiency_weight=0.0 if ablate_efficiency else 0.1,
+                belief_consistency_weight=0.0 if ablate_belief else 0.1,
+                batch_size=batch_size,
+            )
         stats = _merge_training_stats(stats, epoch_stats)
         epochs_trained += 1
 
-        if not validation_records:
-            continue
-
-        val_masked_cross_entropy, val_evaluated = _evaluate_masked_cross_entropy(model, validation_records)
+        if using_preencoded_cache:
+            if validation_preencoded is None or len(validation_preencoded['family_target']) <= 0:
+                continue
+            val_masked_cross_entropy, val_evaluated = model.evaluate_preencoded_loss(validation_preencoded)
+        else:
+            if not validation_records_list:
+                continue
+            val_masked_cross_entropy, val_evaluated = _evaluate_masked_cross_entropy(model, validation_records_list)
         if val_masked_cross_entropy is None:
             if verbose:
                 print('validation skipped for epoch %d/%d (no evaluable records)' % (epoch_idx + 1, epoch_total))
@@ -407,10 +573,15 @@ def train_cnn(
     if verbose:
         print('model.fit completed elapsed=%.2fs samples=%d epochs_trained=%d' % (time.perf_counter() - fit_start, int(stats.get('samples', 0)), int(epochs_trained)))
 
-    calibration_start = time.perf_counter()
-    selected_temperature = _select_calibration_temperature(model, dataset_path, max_records=max_records, verbose=verbose)
-    if verbose:
-        print('calibration selection completed elapsed=%.2fs selected_temperature=%.2f' % (time.perf_counter() - calibration_start, selected_temperature))
+    if using_preencoded_cache:
+        selected_temperature = 1.0
+        if verbose:
+            print('skipping calibration sweep for preencoded cache training; selected_temperature=1.00')
+    else:
+        calibration_start = time.perf_counter()
+        selected_temperature = _select_calibration_temperature(model, dataset_path, max_records=max_records, verbose=verbose)
+        if verbose:
+            print('calibration selection completed elapsed=%.2fs selected_temperature=%.2f' % (time.perf_counter() - calibration_start, selected_temperature))
 
     model.set_calibration_temperature(selected_temperature)
 
@@ -427,8 +598,8 @@ def train_cnn(
             'decision_only': bool(effective_decision_only),
             'decision_only_requested': bool(requested_decision_only),
             'decision_only_fallback_used': bool(decision_only_fallback_used),
-            'train_record_count': int(len(train_records)),
-            'validation_record_count': int(len(validation_records)),
+            'train_record_count': int(train_count),
+            'validation_record_count': int(val_count),
             'train_split_ratio': 0.8,
             'batch_size': int(batch_size),
             'policy_weight': float(policy_weight),
@@ -449,6 +620,9 @@ def train_cnn(
             'requested_device': model.requested_device,
             'resolved_device': model.resolved_device,
             'mixed_precision_enabled': bool(model.amp_enabled),
+            'torch_compile_enabled': bool(model.compile_enabled),
+            'using_preencoded_cache': bool(using_preencoded_cache),
+            'cache_path': cache_path,
             'early_stopping': {
                 'enabled': True,
                 'patience': int(patience_value),
@@ -611,6 +785,7 @@ def _cmd_train_cnn(args):
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         batch_size=args.batch_size,
+        cache_path=args.cache,
     )
     summary = {
         'model_type': result.get('model_type'),
@@ -633,6 +808,18 @@ def _cmd_eval_cnn(args):
         max_records=args.max_records,
     )
     print(json.dumps(metrics, indent=2, sort_keys=True))
+
+
+def _cmd_preencode_cnn(args):
+    summary = preencode_cnn(
+        dataset_path=args.dataset,
+        cache_out_path=args.output,
+        max_records=args.max_records,
+        decision_only=args.decision_only,
+        device=args.device,
+        verbose=args.verbose,
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
 
 
 def _cmd_ingest_jsonl(args):
@@ -707,7 +894,17 @@ def main():
     train_cnn_parser.add_argument('--early-stopping-patience', type=int, default=2, help='Stop if validation loss does not improve for N epochs')
     train_cnn_parser.add_argument('--early-stopping-min-delta', type=float, default=0.0, help='Minimum validation loss improvement required to reset patience')
     train_cnn_parser.add_argument('--batch-size', type=int, default=256, help='Supervised training batch size')
+    train_cnn_parser.add_argument('--cache', default=None, help='Optional pre-encoded dataset cache (.npz)')
     train_cnn_parser.set_defaults(func=_cmd_train_cnn)
+
+    preencode_parser = sub.add_parser('preencode-cnn', help='Pre-encode dataset tensors to cache for high-throughput training')
+    preencode_parser.add_argument('--dataset', required=True, help='Input JSONL trajectory dataset path')
+    preencode_parser.add_argument('--output', required=True, help='Output .npz cache path')
+    preencode_parser.add_argument('--max-records', type=int, default=None, help='Optional cap for pre-encoding')
+    preencode_parser.add_argument('--decision-only', action='store_true', help='Encode only decision states (legal_actions > 1)')
+    preencode_parser.add_argument('--device', default='cpu', help='Device to use for feature encoding (usually cpu)')
+    preencode_parser.add_argument('--verbose', action='store_true', help='Print pre-encoding progress')
+    preencode_parser.set_defaults(func=_cmd_preencode_cnn)
 
     eval_cnn_parser = sub.add_parser('eval-cnn', help='Evaluate CNN policy-value model on JSONL trajectory dataset')
     eval_cnn_parser.add_argument('--dataset', required=True, help='Input JSONL trajectory dataset path')
