@@ -285,7 +285,7 @@ def _slice_preencoded(preencoded, indices):
     }
 
 
-def preencode_cnn(dataset_path, cache_out_path, max_records=None, decision_only=False, device='cpu', verbose=False):
+def preencode_cnn(dataset_path, cache_out_path, max_records=None, decision_only=False, device='cuda', verbose=False):
     start = time.perf_counter()
     codec = ActionCodec()
     model = CnnPolicyValueModel(action_space_size=codec.size, hidden_size=32, learning_rate=0.001, device=device)
@@ -902,7 +902,7 @@ def main():
     preencode_parser.add_argument('--output', required=True, help='Output .npz cache path')
     preencode_parser.add_argument('--max-records', type=int, default=None, help='Optional cap for pre-encoding')
     preencode_parser.add_argument('--decision-only', action='store_true', help='Encode only decision states (legal_actions > 1)')
-    preencode_parser.add_argument('--device', default='cpu', help='Device to use for feature encoding (usually cpu)')
+    preencode_parser.add_argument('--device', default='cuda', help='Device to use for feature encoding (usually cuda)')
     preencode_parser.add_argument('--verbose', action='store_true', help='Print pre-encoding progress')
     preencode_parser.set_defaults(func=_cmd_preencode_cnn)
 
