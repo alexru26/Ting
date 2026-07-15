@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import time
 
 from action_codec import ActionCodec
 from dataset import JsonlTrajectoryReader, create_mixed_split_manifest, ingest_external_jsonl
@@ -96,11 +97,17 @@ def _temperature_rescale_distribution(probs, temperature):
     return {action: value / total for action, value in weighted.items()}
 
 
-def _select_calibration_temperature(model, dataset_path, max_records=None):
+def _select_calibration_temperature(model, dataset_path, max_records=None, verbose=False):
     candidate_temperatures = [0.7, 0.85, 1.0, 1.15, 1.3, 1.5]
     best_temperature = 1.0
     best_nll = None
+    sweep_start = time.perf_counter()
+
+    if verbose:
+        print('starting calibration sweep over %d temperatures' % len(candidate_temperatures))
+
     for temperature in candidate_temperatures:
+        candidate_start = time.perf_counter()
         nll_sum = 0.0
         evaluated = 0
         for record in _iter_records(dataset_path, max_records=max_records):
@@ -119,11 +126,22 @@ def _select_calibration_temperature(model, dataset_path, max_records=None):
             evaluated += 1
 
         if evaluated <= 0:
+            if verbose:
+                elapsed = time.perf_counter() - candidate_start
+                print('calibration temperature=%.2f skipped (evaluated=0, elapsed=%.2fs)' % (temperature, elapsed))
             continue
         nll = nll_sum / float(evaluated)
         if best_nll is None or nll < best_nll:
             best_nll = nll
             best_temperature = temperature
+        if verbose:
+            elapsed = time.perf_counter() - candidate_start
+            print('calibration temperature=%.2f nll=%.6f evaluated=%d elapsed=%.2fs' % (temperature, nll, evaluated, elapsed))
+
+    if verbose:
+        total_elapsed = time.perf_counter() - sweep_start
+        print('completed calibration sweep in %.2fs, selected_temperature=%.2f' % (total_elapsed, best_temperature))
+
     return float(best_temperature)
 
 
@@ -183,6 +201,13 @@ def train_cnn(
     ablate_search=False,
     device='auto',
 ):
+    train_start = time.perf_counter()
+
+    if verbose:
+        print('starting train_cnn dataset=%s out=%s epochs=%d hidden_size=%d decision_only=%s device=%s max_records=%s'
+              % (dataset_path, model_out_path, int(epochs), int(hidden_size), str(bool(decision_only)), str(device), str(max_records)))
+
+    model_init_start = time.perf_counter()
     model_out_path = _resolve_model_out_path(model_out_path)
     codec = ActionCodec()
     model = CnnPolicyValueModel(
@@ -191,7 +216,10 @@ def train_cnn(
         learning_rate=learning_rate,
         device=device,
     )
+    if verbose:
+        print('model initialized resolved_device=%s elapsed=%.2fs' % (model.resolved_device, time.perf_counter() - model_init_start))
 
+    data_prep_start = time.perf_counter()
     if decision_only:
         records, dropped_forced = _collect_training_records(
             dataset_path,
@@ -204,7 +232,11 @@ def train_cnn(
     else:
         records = list(_iter_records(dataset_path, max_records=max_records))
         dropped_forced = 0
+    if verbose:
+        prepared_count = len(records) if isinstance(records, list) else 'stream'
+        print('data preparation done records=%s dropped_forced=%d elapsed=%.2fs' % (str(prepared_count), int(dropped_forced), time.perf_counter() - data_prep_start))
 
+    fit_start = time.perf_counter()
     stats = model.fit(
         records,
         epochs=epochs,
@@ -219,9 +251,17 @@ def train_cnn(
         efficiency_weight=0.0 if ablate_efficiency else 0.1,
         belief_consistency_weight=0.0 if ablate_belief else 0.1,
     )
-    selected_temperature = _select_calibration_temperature(model, dataset_path, max_records=max_records)
+    if verbose:
+        print('model.fit completed elapsed=%.2fs samples=%d' % (time.perf_counter() - fit_start, int(stats.get('samples', 0))))
+
+    calibration_start = time.perf_counter()
+    selected_temperature = _select_calibration_temperature(model, dataset_path, max_records=max_records, verbose=verbose)
+    if verbose:
+        print('calibration selection completed elapsed=%.2fs selected_temperature=%.2f' % (time.perf_counter() - calibration_start, selected_temperature))
+
     model.set_calibration_temperature(selected_temperature)
 
+    metadata_start = time.perf_counter()
     model.metadata.update(
         {
             'dataset_path': dataset_path,
@@ -251,9 +291,19 @@ def train_cnn(
             'resolved_device': model.resolved_device,
         }
     )
+    if verbose:
+        print('metadata update completed elapsed=%.2fs' % (time.perf_counter() - metadata_start))
+
+    save_start = time.perf_counter()
     model.save(model_out_path)
+    if verbose:
+        print('model.save completed path=%s elapsed=%.2fs' % (model_out_path, time.perf_counter() - save_start))
+
     result = model.to_dict()
     result['training_stats'] = stats
+    if verbose:
+        print('train_cnn finished total_elapsed=%.2fs' % (time.perf_counter() - train_start))
+
     return result
 
 
