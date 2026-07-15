@@ -200,14 +200,15 @@ class CnnPolicyValueModel:
 
         self.calibration_temperature = max(1e-3, _safe_float(self.metadata.get('calibration_temperature', 1.0), 1.0))
 
-        self.model = cast(Any, CnnCore(
+        self.eager_model = cast(Any, CnnCore(
             hidden_size=self.hidden_size,
             family_size=len(self.family_vocab),
             arg_size=len(self.arg_vocab),
         ).to(self.device))
+        self.model = self.eager_model
         if self.device.type == 'cuda' and hasattr(torch, 'compile'):
             try:
-                self.model = cast(Any, torch.compile(self.model))
+                self.model = cast(Any, torch.compile(self.eager_model))
                 self.compile_enabled = True
             except Exception:
                 self.compile_enabled = False
@@ -220,6 +221,35 @@ class CnnPolicyValueModel:
         if not self.amp_enabled:
             return nullcontext()
         return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
+
+    def _can_fallback_compile_error(self, exc):
+        message = str(exc)
+        lowered = message.lower()
+        return (
+            'inductorerror' in lowered
+            or 'torch._inductor' in lowered
+            or 'triton' in lowered
+            or 'failed to find c compiler' in lowered
+            or 'triton.knobs.build.impl' in lowered
+        )
+
+    def _disable_compile_and_retry(self, tile_tensor, meta_tensor, exc):
+        if not self.compile_enabled:
+            raise exc
+        if not self._can_fallback_compile_error(exc):
+            raise exc
+
+        print('compile backend unavailable; falling back to eager execution')
+        self.compile_enabled = False
+        self.model = self.eager_model
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        return self.model(tile_tensor, meta_tensor)
+
+    def _forward(self, tile_tensor, meta_tensor):
+        try:
+            return self.model(tile_tensor, meta_tensor)
+        except Exception as exc:
+            return self._disable_compile_and_retry(tile_tensor, meta_tensor, exc)
 
     def _zero_tile_tensor(self):
         return torch.zeros((CHANNEL_COUNT, TILE_COUNT), dtype=torch.float32, device=self.device)
@@ -445,7 +475,7 @@ class CnnPolicyValueModel:
         self.model.eval()
         with torch.no_grad():
             tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self.model(tile_tensor, meta_tensor)
+            outputs = self._forward(tile_tensor, meta_tensor)
             raw_scores = self._legal_action_scores(
                 outputs,
                 legal_actions,
@@ -526,7 +556,7 @@ class CnnPolicyValueModel:
         self.model.eval()
         with torch.no_grad():
             tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self.model(tile_tensor, meta_tensor)
+            outputs = self._forward(tile_tensor, meta_tensor)
             family_logits = outputs['family_logits'][0]
             if deterministic:
                 family_index = int(torch.argmax(family_logits).item())
@@ -580,7 +610,7 @@ class CnnPolicyValueModel:
         self.model.eval()
         with torch.no_grad():
             tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self.model(tile_tensor, meta_tensor)
+            outputs = self._forward(tile_tensor, meta_tensor)
             return float(outputs['value'][0, 0].item())
 
     def _belief_consistency_penalty(self, outputs, features, batch_index=0):
@@ -648,7 +678,7 @@ class CnnPolicyValueModel:
 
         self.model.train()
         with self._autocast_context():
-            outputs = self.model(tile, meta)
+            outputs = self._forward(tile, meta)
             policy_loss, arg1_logits, arg2_logits = self._vectorized_policy_loss(
                 outputs,
                 family,
@@ -722,8 +752,29 @@ class CnnPolicyValueModel:
         efficiency_weight=0.1,
         belief_consistency_weight=0.1,
         show_progress=False,
+        sample_indices=None,
     ):
-        total = int(len(preencoded['family_target']))
+        total_all = int(len(preencoded['family_target']))
+        if sample_indices is None:
+            base_indices = np.arange(total_all, dtype=np.int64)
+        else:
+            base_indices = np.asarray(sample_indices, dtype=np.int64)
+        total = int(len(base_indices))
+        if total <= 0:
+            return {
+                'samples': 0,
+                'action_loss': 0.0,
+                'value_loss': 0.0,
+                'aux_value_loss': 0.0,
+                'belief_loss': 0.0,
+                'belief_consistency_loss': 0.0,
+                'efficiency_bonus': 0.0,
+                'action_hits': 0,
+                'weighted_total_loss': 0.0,
+                'decision_samples': 0,
+                'decision_hits': 0,
+                'forced_samples': 0,
+            }
         batch_size = max(1, int(batch_size))
         stats = {
             'samples': 0,
@@ -741,7 +792,7 @@ class CnnPolicyValueModel:
         }
 
         for epoch_idx in range(max(1, int(epochs))):
-            indices = np.arange(total, dtype=np.int64)
+            indices = np.array(base_indices, copy=True)
             if shuffle:
                 rng = np.random.default_rng(self.seed + epoch_idx)
                 rng.shuffle(indices)
@@ -777,7 +828,15 @@ class CnnPolicyValueModel:
         return stats
 
     def evaluate_preencoded_loss(self, preencoded, batch_size=1024):
-        total = int(len(preencoded['family_target']))
+        return self.evaluate_preencoded_loss_for_indices(preencoded, sample_indices=None, batch_size=batch_size)
+
+    def evaluate_preencoded_loss_for_indices(self, preencoded, sample_indices=None, batch_size=1024):
+        total_all = int(len(preencoded['family_target']))
+        if sample_indices is None:
+            eval_indices = np.arange(total_all, dtype=np.int64)
+        else:
+            eval_indices = np.asarray(sample_indices, dtype=np.int64)
+        total = int(len(eval_indices))
         if total <= 0:
             return None, 0
 
@@ -787,9 +846,9 @@ class CnnPolicyValueModel:
         self.model.eval()
         with torch.no_grad():
             for start in range(0, total, batch_size):
-                idx = np.arange(start, min(start + batch_size, total), dtype=np.int64)
+                idx = eval_indices[start: min(start + batch_size, total)]
                 tile, meta, family, arg1, arg2, _reward, _decision_mask, _belief_target, _seen_mask = self._preencoded_batch(preencoded, idx)
-                outputs = self.model(tile, meta)
+                outputs = self._forward(tile, meta)
                 family_loss = F.cross_entropy(outputs['family_logits'], family, reduction='none')
                 arg1_logits, arg2_logits = self.model.conditioned_arg_logits(outputs['hidden'], family)
                 arg1_loss = F.cross_entropy(arg1_logits, arg1, reduction='none')
@@ -842,7 +901,7 @@ class CnnPolicyValueModel:
         self.model.train()
         with self._autocast_context():
             tile_tensor, meta_tensor = self._encode_batch_features(feature_list)
-            outputs = self.model(tile_tensor, meta_tensor)
+            outputs = self._forward(tile_tensor, meta_tensor)
 
             sample_losses = []
             sample_action_losses = []
@@ -956,7 +1015,7 @@ class CnnPolicyValueModel:
         self.model.train()
         with self._autocast_context():
             tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self.model(tile_tensor, meta_tensor)
+            outputs = self._forward(tile_tensor, meta_tensor)
 
             scores = self._legal_action_scores(outputs, legal_actions, features=features, belief_weight=0.0, efficiency_weight=efficiency_weight).unsqueeze(0)
             target_index = torch.tensor([legal_actions.index(action)], dtype=torch.long, device=self.device)
@@ -1013,7 +1072,7 @@ class CnnPolicyValueModel:
         self.model.train()
         with self._autocast_context():
             tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self.model(tile_tensor, meta_tensor)
+            outputs = self._forward(tile_tensor, meta_tensor)
 
             scores = self._legal_action_scores(outputs, legal_actions, features=features)
             log_probabilities = torch.log_softmax(scores, dim=0)

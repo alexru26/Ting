@@ -531,16 +531,17 @@ def train_cnn(
     split_seed = int(model.seed)
     train_records_list = []
     validation_records_list = []
-    train_preencoded = None
-    validation_preencoded = None
+    train_preencoded_indices = None
+    validation_preencoded_indices = None
     if using_preencoded_cache:
         if preencoded is None:
             raise ValueError('Cache loading failed: preencoded payload is missing.')
-        train_idx, val_idx = _split_index_array(len(preencoded['family_target']), train_ratio=0.8, seed=split_seed)
-        train_preencoded = _slice_preencoded(preencoded, train_idx)
-        validation_preencoded = _slice_preencoded(preencoded, val_idx)
-        train_count = int(len(train_preencoded['family_target']))
-        val_count = int(len(validation_preencoded['family_target']))
+        cache_total = int(len(preencoded['family_target']))
+        if max_records is not None:
+            cache_total = min(cache_total, int(max_records))
+        train_preencoded_indices, validation_preencoded_indices = _split_index_array(cache_total, train_ratio=0.8, seed=split_seed)
+        train_count = int(len(train_preencoded_indices))
+        val_count = int(len(validation_preencoded_indices))
     else:
         train_records_list, validation_records_list = _split_records(records, train_ratio=0.8, seed=split_seed)
         train_count = len(train_records_list)
@@ -569,15 +570,16 @@ def train_cnn(
             print('early-stopping loop epoch %d/%d training_records=%d validation_records=%d' % (epoch_idx + 1, epoch_total, train_count, val_count))
 
         if using_preencoded_cache:
-            if train_preencoded is None:
+            if train_preencoded_indices is None:
                 raise ValueError('Training pre-encoded split is missing.')
             epoch_stats = model.fit_preencoded(
-                train_preencoded,
+                preencoded,
                 epochs=1,
                 batch_size=batch_size,
                 shuffle=True,
                 verbose=False,
                 show_progress=bool(verbose),
+                sample_indices=train_preencoded_indices,
                 policy_weight=policy_weight,
                 value_weight=value_weight,
                 belief_weight=belief_weight,
@@ -607,9 +609,12 @@ def train_cnn(
         epochs_trained += 1
 
         if using_preencoded_cache:
-            if validation_preencoded is None or len(validation_preencoded['family_target']) <= 0:
+            if validation_preencoded_indices is None or len(validation_preencoded_indices) <= 0:
                 continue
-            val_masked_cross_entropy, val_evaluated = model.evaluate_preencoded_loss(validation_preencoded)
+            val_masked_cross_entropy, val_evaluated = model.evaluate_preencoded_loss_for_indices(
+                preencoded,
+                sample_indices=validation_preencoded_indices,
+            )
         else:
             if not validation_records_list:
                 continue
