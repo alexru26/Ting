@@ -708,6 +708,15 @@ class CnnPolicyValueModel:
 
         epoch_count = int(epochs)
         for epoch_index in range(epoch_count):
+            if verbose:
+                print('starting epoch %d/%d' % (epoch_index + 1, epoch_count))
+
+            epoch_start_samples = stats['samples']
+            epoch_start_action_loss = stats['action_loss']
+            epoch_start_value_loss = stats['value_loss']
+            epoch_start_weighted_total_loss = stats['weighted_total_loss']
+            epoch_start_action_hits = stats['action_hits']
+
             if shuffle:
                 record_list = list(records)
                 order = torch.randperm(len(record_list), generator=torch.Generator().manual_seed(self.seed + epoch_index)).tolist()
@@ -715,8 +724,11 @@ class CnnPolicyValueModel:
             else:
                 iterable = records
 
+            epoch_processed = 0
             for record in iterable:
                 if limit is not None and stats['samples'] >= limit:
+                    if verbose:
+                        print('stopping early at max_records=%d' % limit)
                     return stats
                 legal_actions = list(record.legal_actions or [])
                 if record.action not in legal_actions:
@@ -750,18 +762,26 @@ class CnnPolicyValueModel:
                 else:
                     stats['forced_samples'] += 1
 
+                epoch_processed += 1
+                if verbose and (epoch_processed == 1 or epoch_processed % 10000 == 0):
+                    print('epoch %d/%d processed_records=%d total_samples=%d' % (epoch_index + 1, epoch_count, epoch_processed, stats['samples']))
+
             if verbose and stats['samples'] > 0:
-                samples = float(stats['samples'])
+                epoch_samples = stats['samples'] - epoch_start_samples
+                if epoch_samples <= 0:
+                    print('epoch %d/%d had no records to train on' % (epoch_index + 1, epoch_count))
+                    continue
+                samples = float(epoch_samples)
                 print(
                     'epoch %d/%d samples=%d action_loss=%.6f value_loss=%.6f weighted_total_loss=%.6f action_accuracy=%.6f'
                     % (
                         epoch_index + 1,
                         epoch_count,
-                        stats['samples'],
-                        stats['action_loss'] / samples,
-                        stats['value_loss'] / samples,
-                        stats['weighted_total_loss'] / samples,
-                        float(stats['action_hits']) / samples,
+                        epoch_samples,
+                        (stats['action_loss'] - epoch_start_action_loss) / samples,
+                        (stats['value_loss'] - epoch_start_value_loss) / samples,
+                        (stats['weighted_total_loss'] - epoch_start_weighted_total_loss) / samples,
+                        float(stats['action_hits'] - epoch_start_action_hits) / samples,
                     )
                 )
 
