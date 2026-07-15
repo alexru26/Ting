@@ -184,15 +184,22 @@ class CnnPolicyValueModel:
             self.grad_scaler = torch.amp.GradScaler('cuda', enabled=self.amp_enabled)
         except Exception:
             self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
+        self.compile_enabled = False
         torch.manual_seed(self.seed)
 
         self.calibration_temperature = max(1e-3, _safe_float(self.metadata.get('calibration_temperature', 1.0), 1.0))
 
-        self.model = CnnCore(
+        self.model = cast(Any, CnnCore(
             hidden_size=self.hidden_size,
             family_size=len(self.family_vocab),
             arg_size=len(self.arg_vocab),
-        ).to(self.device)
+        ).to(self.device))
+        if self.device.type == 'cuda' and hasattr(torch, 'compile'):
+            try:
+                self.model = cast(Any, torch.compile(self.model))
+                self.compile_enabled = True
+            except Exception:
+                self.compile_enabled = False
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
         if state_dict is not None:
@@ -349,6 +356,9 @@ class CnnPolicyValueModel:
             self.arg_index.get(arg1, self.arg_index[NONE_TOKEN]),
             self.arg_index.get(arg2, self.arg_index[NONE_TOKEN]),
         )
+
+    def encode_action_targets(self, action):
+        return self._action_indices(action)
 
     def _conditioned_arg_logits(self, outputs, family_index, batch_index=0):
         family_tensor = torch.tensor([int(family_index)], dtype=torch.long, device=self.device)
@@ -588,6 +598,187 @@ class CnnPolicyValueModel:
             tile_tensors.append(tile_tensor.squeeze(0))
             meta_tensors.append(meta_tensor.squeeze(0))
         return torch.stack(tile_tensors, dim=0), torch.stack(meta_tensors, dim=0)
+
+    def _preencoded_batch(self, preencoded, indices):
+        idx = np.asarray(indices, dtype=np.int64)
+        tile = torch.tensor(preencoded['tile_tensor'][idx], dtype=torch.float32, device=self.device)
+        meta = torch.tensor(preencoded['meta_tensor'][idx], dtype=torch.float32, device=self.device)
+        family = torch.tensor(preencoded['family_target'][idx], dtype=torch.long, device=self.device)
+        arg1 = torch.tensor(preencoded['arg1_target'][idx], dtype=torch.long, device=self.device)
+        arg2 = torch.tensor(preencoded['arg2_target'][idx], dtype=torch.long, device=self.device)
+        reward = torch.tensor(preencoded['reward'][idx], dtype=torch.float32, device=self.device).unsqueeze(1)
+        decision_mask = torch.tensor(preencoded['decision_mask'][idx], dtype=torch.bool, device=self.device)
+        belief_target = torch.tensor(preencoded['belief_target'][idx], dtype=torch.float32, device=self.device)
+        seen_mask = torch.tensor(preencoded['seen_full_mask'][idx], dtype=torch.float32, device=self.device)
+        return tile, meta, family, arg1, arg2, reward, decision_mask, belief_target, seen_mask
+
+    def _vectorized_policy_loss(self, outputs, family_target, arg1_target, arg2_target, decision_mask, policy_weight, forced_policy_weight):
+        family_loss = F.cross_entropy(outputs['family_logits'], family_target, reduction='none')
+        arg1_logits, arg2_logits = self.model.conditioned_arg_logits(outputs['hidden'], family_target)
+        arg1_loss = F.cross_entropy(arg1_logits, arg1_target, reduction='none')
+        arg2_loss = F.cross_entropy(arg2_logits, arg2_target, reduction='none')
+        per_sample = family_loss + arg1_loss + arg2_loss
+        weights = torch.where(decision_mask, torch.full_like(per_sample, float(policy_weight)), torch.full_like(per_sample, float(forced_policy_weight)))
+        return (weights * per_sample).mean(), arg1_logits, arg2_logits
+
+    def train_preencoded_batch(
+        self,
+        preencoded,
+        indices,
+        policy_weight=1.0,
+        value_weight=0.5,
+        belief_weight=0.25,
+        forced_policy_weight=0.0,
+        aux_value_weight=0.15,
+        efficiency_weight=0.1,
+        belief_consistency_weight=0.1,
+    ):
+        tile, meta, family, arg1, arg2, reward, decision_mask, belief_target, seen_mask = self._preencoded_batch(preencoded, indices)
+
+        self.model.train()
+        with self._autocast_context():
+            outputs = self.model(tile, meta)
+            policy_loss, arg1_logits, arg2_logits = self._vectorized_policy_loss(
+                outputs,
+                family,
+                arg1,
+                arg2,
+                decision_mask,
+                policy_weight,
+                forced_policy_weight,
+            )
+            value_loss = F.mse_loss(outputs['value'], reward)
+            aux_target = torch.tanh(reward)
+            aux_value_loss = F.mse_loss(outputs['aux_value'], aux_target)
+            belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
+            seen_count = torch.sum(seen_mask, dim=1)
+            seen_penalty = torch.sum(outputs['belief_probs'] * seen_mask, dim=1)
+            seen_penalty = torch.where(seen_count > 0, seen_penalty / torch.clamp(seen_count, min=1.0), torch.zeros_like(seen_penalty))
+            belief_consistency_loss = seen_penalty.mean()
+
+            total_loss = (
+                policy_loss
+                + float(value_weight) * value_loss
+                + float(aux_value_weight) * aux_value_loss
+                + float(belief_weight) * belief_loss
+                + float(belief_consistency_weight) * belief_consistency_loss
+                + float(efficiency_weight) * torch.abs(outputs['efficiency_bonus']).mean()
+            )
+
+        self.optimizer.zero_grad()
+        if self.amp_enabled:
+            self.grad_scaler.scale(total_loss).backward()
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            total_loss.backward()
+            self.optimizer.step()
+
+        with torch.no_grad():
+            pred_family = torch.argmax(outputs['family_logits'], dim=1)
+            pred_arg1 = torch.argmax(arg1_logits, dim=1)
+            pred_arg2 = torch.argmax(arg2_logits, dim=1)
+            action_hit_tensor = ((pred_family == family) & (pred_arg1 == arg1) & (pred_arg2 == arg2)).to(torch.int32)
+            decision_int = decision_mask.to(torch.int32)
+
+        return {
+            'samples': int(len(indices)),
+            'action_loss': float(policy_loss.item()) * float(len(indices)),
+            'value_loss': float(value_loss.item()) * float(len(indices)),
+            'aux_value_loss': float(aux_value_loss.item()) * float(len(indices)),
+            'belief_loss': float(belief_loss.item()) * float(len(indices)),
+            'belief_consistency_loss': float(belief_consistency_loss.item()) * float(len(indices)),
+            'weighted_total_loss': float(total_loss.item()) * float(len(indices)),
+            'action_hits': int(torch.sum(action_hit_tensor).item()),
+            'decision_samples': int(torch.sum(decision_int).item()),
+            'decision_hits': int(torch.sum(action_hit_tensor * decision_int).item()),
+            'forced_samples': int(len(indices) - int(torch.sum(decision_int).item())),
+            'efficiency_bonus': float(torch.sum(outputs['efficiency_bonus']).item()),
+        }
+
+    def fit_preencoded(
+        self,
+        preencoded,
+        epochs=1,
+        batch_size=256,
+        shuffle=True,
+        verbose=False,
+        policy_weight=1.0,
+        value_weight=0.5,
+        belief_weight=0.25,
+        forced_policy_weight=0.0,
+        aux_value_weight=0.15,
+        efficiency_weight=0.1,
+        belief_consistency_weight=0.1,
+    ):
+        total = int(len(preencoded['family_target']))
+        batch_size = max(1, int(batch_size))
+        stats = {
+            'samples': 0,
+            'action_loss': 0.0,
+            'value_loss': 0.0,
+            'aux_value_loss': 0.0,
+            'belief_loss': 0.0,
+            'belief_consistency_loss': 0.0,
+            'efficiency_bonus': 0.0,
+            'action_hits': 0,
+            'weighted_total_loss': 0.0,
+            'decision_samples': 0,
+            'decision_hits': 0,
+            'forced_samples': 0,
+        }
+
+        for epoch_idx in range(max(1, int(epochs))):
+            indices = np.arange(total, dtype=np.int64)
+            if shuffle:
+                rng = np.random.default_rng(self.seed + epoch_idx)
+                rng.shuffle(indices)
+
+            if verbose:
+                print('preencoded epoch %d/%d samples=%d batch_size=%d' % (epoch_idx + 1, int(epochs), total, batch_size))
+
+            for start in range(0, total, batch_size):
+                batch_indices = indices[start: start + batch_size]
+                result = self.train_preencoded_batch(
+                    preencoded,
+                    batch_indices,
+                    policy_weight=policy_weight,
+                    value_weight=value_weight,
+                    belief_weight=belief_weight,
+                    forced_policy_weight=forced_policy_weight,
+                    aux_value_weight=aux_value_weight,
+                    efficiency_weight=efficiency_weight,
+                    belief_consistency_weight=belief_consistency_weight,
+                )
+                for key in stats:
+                    stats[key] += result.get(key, 0)
+
+        return stats
+
+    def evaluate_preencoded_loss(self, preencoded, batch_size=1024):
+        total = int(len(preencoded['family_target']))
+        if total <= 0:
+            return None, 0
+
+        batch_size = max(1, int(batch_size))
+        nll_sum = 0.0
+        evaluated = 0
+        self.model.eval()
+        with torch.no_grad():
+            for start in range(0, total, batch_size):
+                idx = np.arange(start, min(start + batch_size, total), dtype=np.int64)
+                tile, meta, family, arg1, arg2, _reward, _decision_mask, _belief_target, _seen_mask = self._preencoded_batch(preencoded, idx)
+                outputs = self.model(tile, meta)
+                family_loss = F.cross_entropy(outputs['family_logits'], family, reduction='none')
+                arg1_logits, arg2_logits = self.model.conditioned_arg_logits(outputs['hidden'], family)
+                arg1_loss = F.cross_entropy(arg1_logits, arg1, reduction='none')
+                arg2_loss = F.cross_entropy(arg2_logits, arg2, reduction='none')
+                nll_sum += float(torch.sum(family_loss + arg1_loss + arg2_loss).item())
+                evaluated += int(len(idx))
+
+        if evaluated <= 0:
+            return None, 0
+        return nll_sum / float(evaluated), evaluated
 
     def train_batch_step(
         self,
