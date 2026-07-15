@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import os
+import random
 import time
 
 from action_codec import ActionCodec
@@ -181,6 +182,80 @@ def _collect_training_records(dataset_path, max_records=None, decision_only=Fals
     return records, dropped_forced
 
 
+def _split_records(records, train_ratio=0.8, seed=7):
+    if not records:
+        return [], []
+
+    indices = list(range(len(records)))
+    rng = random.Random(int(seed))
+    rng.shuffle(indices)
+
+    split_index = int(float(train_ratio) * float(len(indices)))
+    if len(indices) > 1:
+        split_index = max(1, min(split_index, len(indices) - 1))
+    else:
+        split_index = 1
+
+    train_indices = set(indices[:split_index])
+    train_records = []
+    validation_records = []
+    for idx, record in enumerate(records):
+        if idx in train_indices:
+            train_records.append(record)
+        else:
+            validation_records.append(record)
+    return train_records, validation_records
+
+
+def _evaluate_masked_cross_entropy(model, records):
+    nll_sum = 0.0
+    evaluated = 0
+    for record in records:
+        legal_actions = list(record.legal_actions or [])
+        if not legal_actions:
+            continue
+
+        if record.action not in legal_actions:
+            legal_actions.append(record.action)
+
+        probs = model.action_distribution_from_features(record.features, legal_actions)
+        if not probs:
+            continue
+
+        p_true = max(1e-12, float(probs.get(record.action, 0.0)))
+        nll_sum += -math.log(p_true)
+        evaluated += 1
+
+    if evaluated <= 0:
+        return None, 0
+    return nll_sum / float(evaluated), int(evaluated)
+
+
+def _empty_training_stats():
+    return {
+        'samples': 0,
+        'action_loss': 0.0,
+        'value_loss': 0.0,
+        'aux_value_loss': 0.0,
+        'belief_loss': 0.0,
+        'belief_consistency_loss': 0.0,
+        'efficiency_bonus': 0.0,
+        'action_hits': 0,
+        'weighted_total_loss': 0.0,
+        'decision_samples': 0,
+        'decision_hits': 0,
+        'forced_samples': 0,
+    }
+
+
+def _merge_training_stats(accumulated, delta):
+    merged = dict(accumulated)
+    for key, value in delta.items():
+        base = merged.get(key, 0)
+        merged[key] = base + value
+    return merged
+
+
 def train_cnn(
     dataset_path,
     model_out_path,
@@ -200,6 +275,8 @@ def train_cnn(
     ablate_efficiency=False,
     ablate_search=False,
     device='auto',
+    early_stopping_patience=2,
+    early_stopping_min_delta=0.0,
 ):
     train_start = time.perf_counter()
 
@@ -220,39 +297,96 @@ def train_cnn(
         print('model initialized resolved_device=%s elapsed=%.2fs' % (model.resolved_device, time.perf_counter() - model_init_start))
 
     data_prep_start = time.perf_counter()
-    if decision_only:
-        records, dropped_forced = _collect_training_records(
-            dataset_path,
-            max_records=max_records,
-            decision_only=True,
-        )
-    elif max_records is None:
-        records = JsonlTrajectoryReader(dataset_path)
-        dropped_forced = 0
-    else:
-        records = list(_iter_records(dataset_path, max_records=max_records))
-        dropped_forced = 0
+    records, dropped_forced = _collect_training_records(
+        dataset_path,
+        max_records=max_records,
+        decision_only=decision_only,
+    )
     if verbose:
         prepared_count = len(records) if isinstance(records, list) else 'stream'
         print('data preparation done records=%s dropped_forced=%d elapsed=%.2fs' % (str(prepared_count), int(dropped_forced), time.perf_counter() - data_prep_start))
 
-    fit_start = time.perf_counter()
-    stats = model.fit(
-        records,
-        epochs=epochs,
-        max_records=None,
-        shuffle=False,
-        verbose=verbose,
-        policy_weight=policy_weight,
-        value_weight=value_weight,
-        belief_weight=belief_weight,
-        forced_policy_weight=forced_policy_weight,
-        aux_value_weight=0.15,
-        efficiency_weight=0.0 if ablate_efficiency else 0.1,
-        belief_consistency_weight=0.0 if ablate_belief else 0.1,
-    )
+    split_start = time.perf_counter()
+    split_seed = int(model.seed)
+    train_records, validation_records = _split_records(records, train_ratio=0.8, seed=split_seed)
     if verbose:
-        print('model.fit completed elapsed=%.2fs samples=%d' % (time.perf_counter() - fit_start, int(stats.get('samples', 0))))
+        print('dataset split done train_records=%d validation_records=%d split=80/20 elapsed=%.2fs' % (len(train_records), len(validation_records), time.perf_counter() - split_start))
+
+    if not train_records:
+        raise ValueError('No training records available after split. Check dataset size and filters.')
+
+    fit_start = time.perf_counter()
+    epoch_total = max(1, int(epochs))
+    patience_value = max(0, int(early_stopping_patience))
+    min_delta_value = max(0.0, float(early_stopping_min_delta))
+
+    stats = _empty_training_stats()
+    best_val_masked_cross_entropy = None
+    best_epoch = 0
+    best_state_dict = None
+    epochs_without_improvement = 0
+    stopped_early = False
+    epochs_trained = 0
+
+    for epoch_idx in range(epoch_total):
+        if verbose:
+            print('early-stopping loop epoch %d/%d training_records=%d validation_records=%d' % (epoch_idx + 1, epoch_total, len(train_records), len(validation_records)))
+
+        epoch_stats = model.fit(
+            train_records,
+            epochs=1,
+            max_records=None,
+            shuffle=True,
+            verbose=False,
+            policy_weight=policy_weight,
+            value_weight=value_weight,
+            belief_weight=belief_weight,
+            forced_policy_weight=forced_policy_weight,
+            aux_value_weight=0.15,
+            efficiency_weight=0.0 if ablate_efficiency else 0.1,
+            belief_consistency_weight=0.0 if ablate_belief else 0.1,
+        )
+        stats = _merge_training_stats(stats, epoch_stats)
+        epochs_trained += 1
+
+        if not validation_records:
+            continue
+
+        val_masked_cross_entropy, val_evaluated = _evaluate_masked_cross_entropy(model, validation_records)
+        if val_masked_cross_entropy is None:
+            if verbose:
+                print('validation skipped for epoch %d/%d (no evaluable records)' % (epoch_idx + 1, epoch_total))
+            continue
+
+        if verbose:
+            print('validation epoch %d/%d masked_cross_entropy=%.6f evaluated=%d' % (epoch_idx + 1, epoch_total, val_masked_cross_entropy, val_evaluated))
+
+        improved = (
+            best_val_masked_cross_entropy is None
+            or val_masked_cross_entropy < (best_val_masked_cross_entropy - min_delta_value)
+        )
+        if improved:
+            best_val_masked_cross_entropy = val_masked_cross_entropy
+            best_epoch = epoch_idx + 1
+            best_state_dict = model.state_dict()
+            epochs_without_improvement = 0
+            if verbose:
+                print('new best validation metric at epoch %d/%d' % (epoch_idx + 1, epoch_total))
+        else:
+            epochs_without_improvement += 1
+            if verbose:
+                print('no validation improvement for %d epoch(s)' % epochs_without_improvement)
+            if patience_value > 0 and epochs_without_improvement >= patience_value:
+                stopped_early = True
+                if verbose:
+                    print('early stopping triggered at epoch %d/%d (patience=%d)' % (epoch_idx + 1, epoch_total, patience_value))
+                break
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+
+    if verbose:
+        print('model.fit completed elapsed=%.2fs samples=%d epochs_trained=%d' % (time.perf_counter() - fit_start, int(stats.get('samples', 0)), int(epochs_trained)))
 
     calibration_start = time.perf_counter()
     selected_temperature = _select_calibration_temperature(model, dataset_path, max_records=max_records, verbose=verbose)
@@ -272,6 +406,9 @@ def train_cnn(
             'max_records': None if max_records is None else int(max_records),
             'verbose': bool(verbose),
             'decision_only': bool(decision_only),
+            'train_record_count': int(len(train_records)),
+            'validation_record_count': int(len(validation_records)),
+            'train_split_ratio': 0.8,
             'policy_weight': float(policy_weight),
             'value_weight': float(value_weight),
             'belief_weight': float(belief_weight),
@@ -289,6 +426,15 @@ def train_cnn(
             'package_profile': package_profile(),
             'requested_device': model.requested_device,
             'resolved_device': model.resolved_device,
+            'early_stopping': {
+                'enabled': True,
+                'patience': int(patience_value),
+                'min_delta': float(min_delta_value),
+                'stopped_early': bool(stopped_early),
+                'epochs_trained': int(epochs_trained),
+                'best_epoch': int(best_epoch),
+                'best_validation_masked_cross_entropy': None if best_val_masked_cross_entropy is None else float(best_val_masked_cross_entropy),
+            },
         }
     )
     if verbose:
@@ -439,6 +585,8 @@ def _cmd_train_cnn(args):
         ablate_efficiency=args.ablate_efficiency,
         ablate_search=args.ablate_search,
         device=args.device,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
     summary = {
         'model_type': result.get('model_type'),
@@ -532,6 +680,8 @@ def main():
     train_cnn_parser.add_argument('--ablate-efficiency', action='store_true', help='Ablate efficiency bonus usage in training')
     train_cnn_parser.add_argument('--ablate-search', action='store_true', help='Record search ablation setting in metadata')
     train_cnn_parser.add_argument('--device', default='auto', help='Torch device: cpu, cuda, cuda:0, or auto')
+    train_cnn_parser.add_argument('--early-stopping-patience', type=int, default=2, help='Stop if validation loss does not improve for N epochs')
+    train_cnn_parser.add_argument('--early-stopping-min-delta', type=float, default=0.0, help='Minimum validation loss improvement required to reset patience')
     train_cnn_parser.set_defaults(func=_cmd_train_cnn)
 
     eval_cnn_parser = sub.add_parser('eval-cnn', help='Evaluate CNN policy-value model on JSONL trajectory dataset')

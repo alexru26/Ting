@@ -262,6 +262,29 @@ class TestImitationNeuralOnly(unittest.TestCase):
             self.assertTrue(ablation['efficiency'])
             self.assertTrue(ablation['search'])
 
+    def test_train_cnn_records_split_and_early_stopping_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = os.path.join(tmp, 'train.jsonl')
+            model_path = os.path.join(tmp, 'model.h5')
+            self._write_dataset(dataset_path)
+
+            train_result = train_cnn(
+                dataset_path=dataset_path,
+                model_out_path=model_path,
+                epochs=3,
+                early_stopping_patience=1,
+            )
+
+            metadata = train_result['metadata']
+            self.assertEqual(metadata['train_split_ratio'], 0.8)
+            self.assertGreaterEqual(metadata['train_record_count'], 1)
+            self.assertGreaterEqual(metadata['validation_record_count'], 1)
+
+            early_stopping = metadata['early_stopping']
+            self.assertTrue(early_stopping['enabled'])
+            self.assertEqual(early_stopping['patience'], 1)
+            self.assertGreaterEqual(early_stopping['epochs_trained'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()
