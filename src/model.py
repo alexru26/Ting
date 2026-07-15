@@ -1,8 +1,17 @@
 import json
 import math
 import os
-from contextlib import nullcontext
 from typing import Any, cast
+
+class _NoOpContext(object):
+    def __init__(self, enter_result=None):
+        self.enter_result = enter_result
+
+    def __enter__(self):
+        return self.enter_result
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 import h5py
 import numpy as np
@@ -224,7 +233,7 @@ class CnnPolicyValueModel:
 
     def _autocast_context(self):
         if not self.amp_enabled:
-            return nullcontext()
+            return _NoOpContext()
         return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
 
     def _can_fallback_compile_error(self, exc):
