@@ -132,6 +132,33 @@ class TestImitationNeuralOnly(unittest.TestCase):
                 )
             )
 
+    def _write_forced_only_dataset(self, path):
+        with JsonlTrajectoryWriter(path) as writer:
+            writer.write(
+                TrajectoryRecord(
+                    game_id='f1',
+                    turn_index=0,
+                    player_id=0,
+                    request_type=2,
+                    request_action='DRAW',
+                    action='PLAY W1',
+                    legal_actions=['PLAY W1'],
+                    features=_feature_bundle(7),
+                )
+            )
+            writer.write(
+                TrajectoryRecord(
+                    game_id='f2',
+                    turn_index=1,
+                    player_id=0,
+                    request_type=2,
+                    request_action='DRAW',
+                    action='PLAY W2',
+                    legal_actions=['PLAY W2'],
+                    features=_feature_bundle(8),
+                )
+            )
+
     def test_train_eval_and_load_cnn(self):
         codec = ActionCodec()
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,6 +311,25 @@ class TestImitationNeuralOnly(unittest.TestCase):
             self.assertTrue(early_stopping['enabled'])
             self.assertEqual(early_stopping['patience'], 1)
             self.assertGreaterEqual(early_stopping['epochs_trained'], 1)
+
+    def test_train_cnn_decision_only_falls_back_when_no_decision_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = os.path.join(tmp, 'forced_only.jsonl')
+            model_path = os.path.join(tmp, 'model.h5')
+            self._write_forced_only_dataset(dataset_path)
+
+            train_result = train_cnn(
+                dataset_path=dataset_path,
+                model_out_path=model_path,
+                epochs=1,
+                decision_only=True,
+            )
+
+            metadata = train_result['metadata']
+            self.assertTrue(metadata['decision_only_requested'])
+            self.assertFalse(metadata['decision_only'])
+            self.assertTrue(metadata['decision_only_fallback_used'])
+            self.assertGreater(train_result['training_stats']['samples'], 0)
 
 
 if __name__ == '__main__':

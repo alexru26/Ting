@@ -1,6 +1,7 @@
 import json
 import math
 import os
+from contextlib import nullcontext
 from typing import Any, cast
 
 import h5py
@@ -177,6 +178,12 @@ class CnnPolicyValueModel:
         self.device = resolved_device
         self.requested_device = requested_device_name
         self.resolved_device = resolved_device_name
+        self.amp_enabled = bool(self.device.type == 'cuda')
+        self.amp_dtype = torch.bfloat16
+        try:
+            self.grad_scaler = torch.amp.GradScaler('cuda', enabled=self.amp_enabled)
+        except Exception:
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
         torch.manual_seed(self.seed)
 
         self.calibration_temperature = max(1e-3, _safe_float(self.metadata.get('calibration_temperature', 1.0), 1.0))
@@ -190,6 +197,11 @@ class CnnPolicyValueModel:
 
         if state_dict is not None:
             self.load_state_dict(state_dict)
+
+    def _autocast_context(self):
+        if not self.amp_enabled:
+            return nullcontext()
+        return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
 
     def _zero_tile_tensor(self):
         return torch.zeros((CHANNEL_COUNT, TILE_COUNT), dtype=torch.float32, device=self.device)
@@ -338,17 +350,18 @@ class CnnPolicyValueModel:
             self.arg_index.get(arg2, self.arg_index[NONE_TOKEN]),
         )
 
-    def _conditioned_arg_logits(self, outputs, family_index):
+    def _conditioned_arg_logits(self, outputs, family_index, batch_index=0):
         family_tensor = torch.tensor([int(family_index)], dtype=torch.long, device=self.device)
-        return self.model.conditioned_arg_logits(outputs['hidden'], family_tensor)
+        hidden = outputs['hidden'][int(batch_index): int(batch_index) + 1]
+        return self.model.conditioned_arg_logits(hidden, family_tensor)
 
-    def _action_score(self, outputs, action):
+    def _action_score(self, outputs, action, batch_index=0):
         family_index, arg1_index, arg2_index = self._action_indices(action)
-        arg1_logits, arg2_logits = self._conditioned_arg_logits(outputs, family_index)
-        score = outputs['family_logits'][0, family_index] + arg1_logits[0, arg1_index] + arg2_logits[0, arg2_index]
+        arg1_logits, arg2_logits = self._conditioned_arg_logits(outputs, family_index, batch_index=batch_index)
+        score = outputs['family_logits'][int(batch_index), family_index] + arg1_logits[0, arg1_index] + arg2_logits[0, arg2_index]
         return score
 
-    def _belief_bonus(self, outputs, action):
+    def _belief_bonus(self, outputs, action, batch_index=0):
         if 'PLAY ' not in action and 'GANG ' not in action and 'BUGANG ' not in action:
             return 0.0
         parts = action.split()
@@ -359,7 +372,7 @@ class CnnPolicyValueModel:
         belief_probs = outputs.get('belief_probs')
         if belief_probs is None:
             return 0.0
-        return float(belief_probs[0, tile_index].item())
+        return float(belief_probs[int(batch_index), tile_index].item())
 
     def _efficiency_prior(self, features, action):
         if not isinstance(features, dict):
@@ -370,13 +383,14 @@ class CnnPolicyValueModel:
         family = action.split()[0] if action else 'PASS'
         return _safe_float(deltas.get(family, 0.0), 0.0)
 
-    def _legal_action_scores(self, outputs, legal_actions, features=None, belief_weight=0.0, efficiency_weight=0.0):
+    def _legal_action_scores(self, outputs, legal_actions, features=None, belief_weight=0.0, efficiency_weight=0.0, batch_index=0):
         scores = []
-        efficiency_bonus = _safe_float(outputs.get('efficiency_bonus', torch.tensor([[0.0]])).item(), 0.0)
+        efficiency_tensor = outputs.get('efficiency_bonus', torch.tensor([[0.0]], device=self.device))
+        efficiency_bonus = _safe_float(efficiency_tensor[int(batch_index), 0].item(), 0.0)
         for action in legal_actions:
-            score = self._action_score(outputs, action)
+            score = self._action_score(outputs, action, batch_index=batch_index)
             if belief_weight:
-                score = score + float(belief_weight) * self._belief_bonus(outputs, action)
+                score = score + float(belief_weight) * self._belief_bonus(outputs, action, batch_index=batch_index)
             if efficiency_weight:
                 score = score + float(efficiency_weight) * efficiency_bonus * self._efficiency_prior(features, action)
             scores.append(score)
@@ -548,7 +562,7 @@ class CnnPolicyValueModel:
             outputs = self.model(tile_tensor, meta_tensor)
             return float(outputs['value'][0, 0].item())
 
-    def _belief_consistency_penalty(self, outputs, features):
+    def _belief_consistency_penalty(self, outputs, features, batch_index=0):
         if not isinstance(features, dict):
             return torch.tensor(0.0, dtype=torch.float32, device=self.device)
         seen = features.get('seen_counts', [])
@@ -563,8 +577,149 @@ class CnnPolicyValueModel:
         if not indices:
             return torch.tensor(0.0, dtype=torch.float32, device=self.device)
 
-        probs = outputs['belief_probs'][0, indices]
+        probs = outputs['belief_probs'][int(batch_index), indices]
         return probs.mean()
+
+    def _encode_batch_features(self, features_list):
+        tile_tensors = []
+        meta_tensors = []
+        for features in features_list:
+            tile_tensor, meta_tensor = self._encode_features(features)
+            tile_tensors.append(tile_tensor.squeeze(0))
+            meta_tensors.append(meta_tensor.squeeze(0))
+        return torch.stack(tile_tensors, dim=0), torch.stack(meta_tensors, dim=0)
+
+    def train_batch_step(
+        self,
+        batch_records,
+        policy_weight=1.0,
+        value_weight=0.5,
+        belief_weight=0.25,
+        forced_policy_weight=0.0,
+        aux_value_weight=0.15,
+        efficiency_weight=0.1,
+        belief_consistency_weight=0.1,
+    ):
+        if not batch_records:
+            return {
+                'samples': 0,
+                'action_loss': 0.0,
+                'value_loss': 0.0,
+                'aux_value_loss': 0.0,
+                'belief_loss': 0.0,
+                'belief_consistency_loss': 0.0,
+                'weighted_total_loss': 0.0,
+                'action_hits': 0,
+                'decision_samples': 0,
+                'decision_hits': 0,
+                'forced_samples': 0,
+                'efficiency_bonus': 0.0,
+            }
+
+        prepared = []
+        feature_list = []
+        for record in batch_records:
+            legal_actions = list(record.legal_actions or [])
+            if record.action not in legal_actions:
+                legal_actions.append(record.action)
+            is_decision_state = len(legal_actions) > 1
+            record_policy_weight = float(policy_weight) if is_decision_state else float(forced_policy_weight)
+            prepared.append((record, legal_actions, is_decision_state, record_policy_weight))
+            feature_list.append(record.features)
+
+        self.model.train()
+        with self._autocast_context():
+            tile_tensor, meta_tensor = self._encode_batch_features(feature_list)
+            outputs = self.model(tile_tensor, meta_tensor)
+
+            sample_losses = []
+            sample_action_losses = []
+            sample_value_losses = []
+            sample_aux_value_losses = []
+            sample_belief_losses = []
+            sample_belief_consistency_losses = []
+            action_hits = 0
+            decision_samples = 0
+            decision_hits = 0
+            forced_samples = 0
+            efficiency_bonus_sum = 0.0
+
+            for idx, (record, legal_actions, is_decision_state, record_policy_weight) in enumerate(prepared):
+                scores = self._legal_action_scores(
+                    outputs,
+                    legal_actions,
+                    features=record.features,
+                    belief_weight=0.0,
+                    efficiency_weight=efficiency_weight,
+                    batch_index=idx,
+                ).unsqueeze(0)
+                target_index = torch.tensor([legal_actions.index(record.action)], dtype=torch.long, device=self.device)
+                action_loss = F.cross_entropy(scores, target_index)
+
+                reward_value = float(_safe_float(record.reward, 0.0))
+                value_target = torch.tensor([[reward_value]], dtype=torch.float32, device=self.device)
+                value_pred = outputs['value'][idx: idx + 1]
+                aux_pred = outputs['aux_value'][idx: idx + 1]
+                value_loss = F.mse_loss(value_pred, value_target)
+                aux_target = torch.tanh(value_target)
+                aux_value_loss = F.mse_loss(aux_pred, aux_target)
+
+                belief_target = torch.tensor([self._belief_target_from_features(record.features)], dtype=torch.float32, device=self.device)
+                belief_pred = outputs['belief_probs'][idx: idx + 1]
+                belief_loss = F.kl_div(torch.log(torch.clamp(belief_pred, min=1e-12)), belief_target, reduction='batchmean')
+                belief_consistency_loss = self._belief_consistency_penalty(outputs, record.features, batch_index=idx)
+
+                sample_loss = (
+                    float(record_policy_weight) * action_loss
+                    + float(value_weight) * value_loss
+                    + float(aux_value_weight) * aux_value_loss
+                    + float(belief_weight) * belief_loss
+                    + float(belief_consistency_weight) * belief_consistency_loss
+                )
+
+                with torch.no_grad():
+                    probabilities = torch.softmax(scores.squeeze(0), dim=0)
+                    action_hit = int(int(torch.argmax(probabilities).item()) == int(target_index.item()))
+                    action_hits += action_hit
+                    if is_decision_state:
+                        decision_samples += 1
+                        decision_hits += action_hit
+                    else:
+                        forced_samples += 1
+
+                sample_losses.append(sample_loss)
+                sample_action_losses.append(float(action_loss.item()))
+                sample_value_losses.append(float(value_loss.item()))
+                sample_aux_value_losses.append(float(aux_value_loss.item()))
+                sample_belief_losses.append(float(belief_loss.item()))
+                sample_belief_consistency_losses.append(float(belief_consistency_loss.item()))
+                efficiency_bonus_sum += float(outputs['efficiency_bonus'][idx, 0].detach().item())
+
+            batch_loss = torch.stack(sample_losses, dim=0).mean()
+
+        self.optimizer.zero_grad()
+        if self.amp_enabled:
+            self.grad_scaler.scale(batch_loss).backward()
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            batch_loss.backward()
+            self.optimizer.step()
+
+        return {
+            'samples': len(batch_records),
+            'action_loss': float(sum(sample_action_losses)),
+            'value_loss': float(sum(sample_value_losses)),
+            'aux_value_loss': float(sum(sample_aux_value_losses)),
+            'belief_loss': float(sum(sample_belief_losses)),
+            'belief_consistency_loss': float(sum(sample_belief_consistency_losses)),
+            'weighted_total_loss': float(sum(float(loss.item()) for loss in sample_losses)),
+            'action_hits': int(action_hits),
+            'decision_samples': int(decision_samples),
+            'decision_hits': int(decision_hits),
+            'forced_samples': int(forced_samples),
+            'efficiency_bonus': float(efficiency_bonus_sum),
+        }
 
     def train_step(
         self,
@@ -587,32 +742,38 @@ class CnnPolicyValueModel:
         is_decision_state = legal_action_count > 1
 
         self.model.train()
-        tile_tensor, meta_tensor = self._encode_features(features)
-        outputs = self.model(tile_tensor, meta_tensor)
+        with self._autocast_context():
+            tile_tensor, meta_tensor = self._encode_features(features)
+            outputs = self.model(tile_tensor, meta_tensor)
 
-        scores = self._legal_action_scores(outputs, legal_actions, features=features, belief_weight=0.0, efficiency_weight=efficiency_weight).unsqueeze(0)
-        target_index = torch.tensor([legal_actions.index(action)], dtype=torch.long, device=self.device)
-        action_loss = F.cross_entropy(scores, target_index)
+            scores = self._legal_action_scores(outputs, legal_actions, features=features, belief_weight=0.0, efficiency_weight=efficiency_weight).unsqueeze(0)
+            target_index = torch.tensor([legal_actions.index(action)], dtype=torch.long, device=self.device)
+            action_loss = F.cross_entropy(scores, target_index)
 
-        value_target = torch.tensor([[float(_safe_float(reward, 0.0))]], dtype=torch.float32, device=self.device)
-        value_loss = F.mse_loss(outputs['value'], value_target)
-        aux_target = torch.tanh(value_target)
-        aux_value_loss = F.mse_loss(outputs['aux_value'], aux_target)
+            value_target = torch.tensor([[float(_safe_float(reward, 0.0))]], dtype=torch.float32, device=self.device)
+            value_loss = F.mse_loss(outputs['value'], value_target)
+            aux_target = torch.tanh(value_target)
+            aux_value_loss = F.mse_loss(outputs['aux_value'], aux_target)
 
-        belief_target = torch.tensor([self._belief_target_from_features(features)], dtype=torch.float32, device=self.device)
-        belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
-        belief_consistency_loss = self._belief_consistency_penalty(outputs, features)
+            belief_target = torch.tensor([self._belief_target_from_features(features)], dtype=torch.float32, device=self.device)
+            belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
+            belief_consistency_loss = self._belief_consistency_penalty(outputs, features)
 
-        loss = (
-            float(policy_weight) * action_loss
-            + float(value_weight) * value_loss
-            + float(aux_value_weight) * aux_value_loss
-            + float(belief_weight) * belief_loss
-            + float(belief_consistency_weight) * belief_consistency_loss
-        )
+            loss = (
+                float(policy_weight) * action_loss
+                + float(value_weight) * value_loss
+                + float(aux_value_weight) * aux_value_loss
+                + float(belief_weight) * belief_loss
+                + float(belief_consistency_weight) * belief_consistency_loss
+            )
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        if self.amp_enabled:
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
 
         with torch.no_grad():
             probabilities = torch.softmax(scores.squeeze(0), dim=0)
@@ -638,34 +799,40 @@ class CnnPolicyValueModel:
             legal_actions = list(legal_actions) + [action]
 
         self.model.train()
-        tile_tensor, meta_tensor = self._encode_features(features)
-        outputs = self.model(tile_tensor, meta_tensor)
+        with self._autocast_context():
+            tile_tensor, meta_tensor = self._encode_features(features)
+            outputs = self.model(tile_tensor, meta_tensor)
 
-        scores = self._legal_action_scores(outputs, legal_actions, features=features)
-        log_probabilities = torch.log_softmax(scores, dim=0)
-        probabilities = torch.softmax(scores, dim=0)
-        action_index = legal_actions.index(action)
-        current_log_prob = log_probabilities[action_index]
+            scores = self._legal_action_scores(outputs, legal_actions, features=features)
+            log_probabilities = torch.log_softmax(scores, dim=0)
+            probabilities = torch.softmax(scores, dim=0)
+            action_index = legal_actions.index(action)
+            current_log_prob = log_probabilities[action_index]
 
-        if old_log_prob is None:
-            old_log_prob = float(current_log_prob.item())
+            if old_log_prob is None:
+                old_log_prob = float(current_log_prob.item())
 
-        ratio = torch.exp(current_log_prob - torch.tensor(float(old_log_prob), dtype=torch.float32, device=self.device))
-        clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_range), 1.0 + float(clip_range))
-        advantage_tensor = torch.tensor(float(advantage), dtype=torch.float32, device=self.device)
-        surrogate = torch.minimum(ratio * advantage_tensor, clipped_ratio * advantage_tensor)
-        policy_loss = -surrogate
+            ratio = torch.exp(current_log_prob - torch.tensor(float(old_log_prob), dtype=torch.float32, device=self.device))
+            clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_range), 1.0 + float(clip_range))
+            advantage_tensor = torch.tensor(float(advantage), dtype=torch.float32, device=self.device)
+            surrogate = torch.minimum(ratio * advantage_tensor, clipped_ratio * advantage_tensor)
+            policy_loss = -surrogate
 
-        entropy = -(probabilities * log_probabilities).sum()
-        return_tensor = torch.tensor([[float(return_target)]], dtype=torch.float32, device=self.device)
-        value_loss = F.mse_loss(outputs['value'], return_tensor)
-        belief_target = torch.tensor([self._belief_target_from_features(features)], dtype=torch.float32, device=self.device)
-        belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
+            entropy = -(probabilities * log_probabilities).sum()
+            return_tensor = torch.tensor([[float(return_target)]], dtype=torch.float32, device=self.device)
+            value_loss = F.mse_loss(outputs['value'], return_tensor)
+            belief_target = torch.tensor([self._belief_target_from_features(features)], dtype=torch.float32, device=self.device)
+            belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
 
-        loss = policy_loss + float(value_coef) * value_loss - float(entropy_coef) * entropy + float(belief_coef) * belief_loss
+            loss = policy_loss + float(value_coef) * value_loss - float(entropy_coef) * entropy + float(belief_coef) * belief_loss
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        if self.amp_enabled:
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
 
         return {
             'policy_loss': float(policy_loss.item()),
@@ -689,6 +856,7 @@ class CnnPolicyValueModel:
         aux_value_weight=0.15,
         efficiency_weight=0.1,
         belief_consistency_weight=0.1,
+        batch_size=1,
     ):
         stats = {
             'samples': 0,
@@ -724,47 +892,88 @@ class CnnPolicyValueModel:
             else:
                 iterable = records
 
+            effective_batch_size = max(1, int(batch_size))
+            pending_batch = []
             epoch_processed = 0
-            for record in iterable:
-                if limit is not None and stats['samples'] >= limit:
-                    if verbose:
-                        print('stopping early at max_records=%d' % limit)
-                    return stats
-                legal_actions = list(record.legal_actions or [])
-                if record.action not in legal_actions:
-                    legal_actions.append(record.action)
-                is_decision_state = len(legal_actions) > 1
-                record_policy_weight = float(policy_weight) if is_decision_state else float(forced_policy_weight)
-                result = self.train_step(
-                    record.features,
-                    legal_actions,
-                    record.action,
-                    record.reward,
-                    policy_weight=record_policy_weight,
+
+            def _flush_pending_batch(current_batch):
+                if not current_batch:
+                    return
+                if effective_batch_size <= 1:
+                    record = current_batch[0]
+                    legal_actions = list(record.legal_actions or [])
+                    if record.action not in legal_actions:
+                        legal_actions.append(record.action)
+                    is_decision_state = len(legal_actions) > 1
+                    record_policy_weight = float(policy_weight) if is_decision_state else float(forced_policy_weight)
+                    result = self.train_step(
+                        record.features,
+                        legal_actions,
+                        record.action,
+                        record.reward,
+                        policy_weight=record_policy_weight,
+                        value_weight=value_weight,
+                        belief_weight=belief_weight,
+                        aux_value_weight=aux_value_weight,
+                        efficiency_weight=efficiency_weight,
+                        belief_consistency_weight=belief_consistency_weight,
+                    )
+                    stats['samples'] += 1
+                    stats['action_loss'] += result['action_loss']
+                    stats['value_loss'] += result['value_loss']
+                    stats['aux_value_loss'] += result.get('aux_value_loss', 0.0)
+                    stats['belief_loss'] += result.get('belief_loss', 0.0)
+                    stats['belief_consistency_loss'] += result.get('belief_consistency_loss', 0.0)
+                    stats['efficiency_bonus'] += result.get('efficiency_bonus', 0.0)
+                    stats['action_hits'] += result['action_hit']
+                    stats['weighted_total_loss'] += result.get('weighted_total_loss', 0.0)
+                    if result.get('is_decision_state'):
+                        stats['decision_samples'] += 1
+                        stats['decision_hits'] += result['action_hit']
+                    else:
+                        stats['forced_samples'] += 1
+                    return
+
+                batch_result = self.train_batch_step(
+                    current_batch,
+                    policy_weight=policy_weight,
                     value_weight=value_weight,
                     belief_weight=belief_weight,
+                    forced_policy_weight=forced_policy_weight,
                     aux_value_weight=aux_value_weight,
                     efficiency_weight=efficiency_weight,
                     belief_consistency_weight=belief_consistency_weight,
                 )
-                stats['samples'] += 1
-                stats['action_loss'] += result['action_loss']
-                stats['value_loss'] += result['value_loss']
-                stats['aux_value_loss'] += result.get('aux_value_loss', 0.0)
-                stats['belief_loss'] += result.get('belief_loss', 0.0)
-                stats['belief_consistency_loss'] += result.get('belief_consistency_loss', 0.0)
-                stats['efficiency_bonus'] += result.get('efficiency_bonus', 0.0)
-                stats['action_hits'] += result['action_hit']
-                stats['weighted_total_loss'] += result.get('weighted_total_loss', 0.0)
-                if result.get('is_decision_state'):
-                    stats['decision_samples'] += 1
-                    stats['decision_hits'] += result['action_hit']
-                else:
-                    stats['forced_samples'] += 1
+                stats['samples'] += batch_result.get('samples', 0)
+                stats['action_loss'] += batch_result.get('action_loss', 0.0)
+                stats['value_loss'] += batch_result.get('value_loss', 0.0)
+                stats['aux_value_loss'] += batch_result.get('aux_value_loss', 0.0)
+                stats['belief_loss'] += batch_result.get('belief_loss', 0.0)
+                stats['belief_consistency_loss'] += batch_result.get('belief_consistency_loss', 0.0)
+                stats['efficiency_bonus'] += batch_result.get('efficiency_bonus', 0.0)
+                stats['action_hits'] += batch_result.get('action_hits', 0)
+                stats['weighted_total_loss'] += batch_result.get('weighted_total_loss', 0.0)
+                stats['decision_samples'] += batch_result.get('decision_samples', 0)
+                stats['decision_hits'] += batch_result.get('decision_hits', 0)
+                stats['forced_samples'] += batch_result.get('forced_samples', 0)
 
+            for record in iterable:
+                if limit is not None and (stats['samples'] + len(pending_batch)) >= limit:
+                    if verbose:
+                        print('stopping early at max_records=%d' % limit)
+                    break
+
+                pending_batch.append(record)
                 epoch_processed += 1
+                if len(pending_batch) >= effective_batch_size:
+                    _flush_pending_batch(pending_batch)
+                    pending_batch = []
+
                 if verbose and (epoch_processed == 1 or epoch_processed % 10000 == 0):
                     print('epoch %d/%d processed_records=%d total_samples=%d' % (epoch_index + 1, epoch_count, epoch_processed, stats['samples']))
+
+            if pending_batch:
+                _flush_pending_batch(pending_batch)
 
             if verbose and stats['samples'] > 0:
                 epoch_samples = stats['samples'] - epoch_start_samples
