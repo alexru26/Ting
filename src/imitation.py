@@ -140,9 +140,12 @@ def _iter_records(dataset_path, max_records=None):
             break
 
 
-def _iter_training_records(dataset_path, max_records=None, decision_only=False):
-    count = 0
+def _collect_training_records(dataset_path, max_records=None, decision_only=False):
+    records = []
+    kept = 0
     dropped_forced = 0
+    limit = None if max_records is None else int(max_records)
+
     for record in JsonlTrajectoryReader(dataset_path):
         legal_actions = list(record.legal_actions or [])
         if record.action not in legal_actions:
@@ -152,21 +155,12 @@ def _iter_training_records(dataset_path, max_records=None, decision_only=False):
             dropped_forced += 1
             continue
 
-        yield record
-        count += 1
-        if max_records is not None and count >= int(max_records):
+        records.append(record)
+        kept += 1
+        if limit is not None and kept >= limit:
             break
 
-
-def _count_dropped_forced(dataset_path):
-    dropped = 0
-    for record in JsonlTrajectoryReader(dataset_path):
-        legal_actions = list(record.legal_actions or [])
-        if record.action not in legal_actions:
-            legal_actions.append(record.action)
-        if len(legal_actions) <= 1:
-            dropped += 1
-    return dropped
+    return records, dropped_forced
 
 
 def train_cnn(
@@ -187,7 +181,7 @@ def train_cnn(
     ablate_belief=False,
     ablate_efficiency=False,
     ablate_search=False,
-    device='cpu',
+    device='auto',
 ):
     model_out_path = _resolve_model_out_path(model_out_path)
     codec = ActionCodec()
@@ -198,21 +192,18 @@ def train_cnn(
         device=device,
     )
 
-    dropped_forced = 0
-    if decision_only and max_records is None:
-        dropped_forced = _count_dropped_forced(dataset_path)
-
     if decision_only:
-        records = list(_iter_training_records(dataset_path, max_records=max_records, decision_only=True))
-        if max_records is not None:
-            total_in_window = 0
-            for _ in _iter_records(dataset_path, max_records=max_records):
-                total_in_window += 1
-            dropped_forced = max(0, total_in_window - len(records))
+        records, dropped_forced = _collect_training_records(
+            dataset_path,
+            max_records=max_records,
+            decision_only=True,
+        )
     elif max_records is None:
         records = JsonlTrajectoryReader(dataset_path)
+        dropped_forced = 0
     else:
         records = list(_iter_records(dataset_path, max_records=max_records))
+        dropped_forced = 0
 
     stats = model.fit(
         records,
@@ -399,7 +390,17 @@ def _cmd_train_cnn(args):
         ablate_search=args.ablate_search,
         device=args.device,
     )
-    print(json.dumps(result, indent=2, sort_keys=True))
+    summary = {
+        'model_type': result.get('model_type'),
+        'backend': result.get('backend'),
+        'action_space_size': result.get('action_space_size'),
+        'hidden_size': result.get('hidden_size'),
+        'learning_rate': result.get('learning_rate'),
+        'seed': result.get('seed'),
+        'metadata': result.get('metadata', {}),
+        'training_stats': result.get('training_stats', {}),
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
 
 
 def _cmd_eval_cnn(args):
@@ -480,7 +481,7 @@ def main():
     train_cnn_parser.add_argument('--ablate-belief', action='store_true', help='Ablate belief-consistency loss terms')
     train_cnn_parser.add_argument('--ablate-efficiency', action='store_true', help='Ablate efficiency bonus usage in training')
     train_cnn_parser.add_argument('--ablate-search', action='store_true', help='Record search ablation setting in metadata')
-    train_cnn_parser.add_argument('--device', default='cpu', help='Torch device: cpu, cuda, cuda:0, or auto')
+    train_cnn_parser.add_argument('--device', default='auto', help='Torch device: cpu, cuda, cuda:0, or auto')
     train_cnn_parser.set_defaults(func=_cmd_train_cnn)
 
     eval_cnn_parser = sub.add_parser('eval-cnn', help='Evaluate CNN policy-value model on JSONL trajectory dataset')
