@@ -3,6 +3,8 @@ import json
 import math
 import os
 import random
+import shutil
+import tempfile
 import time
 
 import numpy as np
@@ -296,83 +298,144 @@ def _slice_preencoded(preencoded, indices):
     }
 
 
-def preencode_cnn(dataset_path, cache_out_path, max_records=None, decision_only=False, device='cuda', verbose=False):
+def preencode_cnn(dataset_path, cache_out_path, max_records=None, decision_only=False, device='cpu', verbose=False):
     start = time.perf_counter()
     codec = ActionCodec()
     model = CnnPolicyValueModel(action_space_size=codec.size, hidden_size=32, learning_rate=0.001, device=device)
 
-    records, dropped_forced = _collect_training_records(
-        dataset_path,
-        max_records=max_records,
-        decision_only=decision_only,
-    )
-    if not records:
+    limit = None if max_records is None else int(max_records)
+
+    def _iter_filtered_records():
+        kept_local = 0
+        dropped_local = 0
+        for record in JsonlTrajectoryReader(dataset_path):
+            legal_actions = list(record.legal_actions or [])
+            if record.action not in legal_actions:
+                legal_actions.append(record.action)
+            if decision_only and len(legal_actions) <= 1:
+                dropped_local += 1
+                continue
+            yield record, legal_actions, dropped_local
+            kept_local += 1
+            if limit is not None and kept_local >= limit:
+                break
+
+    kept_count = 0
+    dropped_forced = 0
+    for _record, _legal_actions, dropped_marker in _iter_filtered_records():
+        kept_count += 1
+        dropped_forced = dropped_marker
+
+    if kept_count <= 0:
         raise ValueError('No records available to pre-encode.')
 
     if verbose:
-        print('preencode starting records=%d decision_only=%s' % (len(records), str(bool(decision_only))))
+        print('preencode starting records=%d decision_only=%s' % (kept_count, str(bool(decision_only))))
 
-    tile_rows = []
-    meta_rows = []
-    family_targets = []
-    arg1_targets = []
-    arg2_targets = []
-    rewards = []
-    decision_mask = []
-    belief_rows = []
-    seen_mask_rows = []
+    first_record = None
+    first_legal_actions = None
+    for record, legal_actions, _dropped in _iter_filtered_records():
+        first_record = record
+        first_legal_actions = legal_actions
+        break
+    if first_record is None or first_legal_actions is None:
+        raise ValueError('No records available to pre-encode.')
 
-    for idx, record in enumerate(records):
-        legal_actions = list(record.legal_actions or [])
-        if record.action not in legal_actions:
-            legal_actions.append(record.action)
-        is_decision = len(legal_actions) > 1
-
-        tile_tensor, meta_tensor = model._encode_features(record.features)
-        tile_rows.append(tile_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False))
-        meta_rows.append(meta_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False))
-
-        family_idx, arg1_idx, arg2_idx = model.encode_action_targets(record.action)
-        family_targets.append(family_idx)
-        arg1_targets.append(arg1_idx)
-        arg2_targets.append(arg2_idx)
-        rewards.append(float(_safe_float(record.reward, 0.0)))
-        decision_mask.append(1 if is_decision else 0)
-        belief_rows.append(np.asarray(model._belief_target_from_features(record.features), dtype=np.float32))
-
-        seen = record.features.get('seen_counts', []) if isinstance(record.features, dict) else []
-        seen_vec = np.zeros((len(model.arg_vocab) - 1,), dtype=np.float32)
-        if isinstance(seen, list):
-            limit = min(len(seen), seen_vec.shape[0])
-            if limit > 0:
-                seen_slice = np.asarray(seen[:limit], dtype=np.float32)
-                seen_vec[:limit] = (seen_slice >= 4.0).astype(np.float32)
-        seen_mask_rows.append(seen_vec)
-
-        if verbose and ((idx + 1) == 1 or (idx + 1) % 1000 == 0 or (idx + 1) == len(records)):
-            _print_progress_bar('preencode', idx + 1, len(records))
+    tile_probe, meta_probe = model._encode_features(first_record.features)
+    tile_shape = tuple(tile_probe.squeeze(0).shape)
+    meta_shape = tuple(meta_probe.squeeze(0).shape)
+    belief_shape = tuple(np.asarray(model._belief_target_from_features(first_record.features), dtype=np.float32).shape)
+    seen_shape = (len(model.arg_vocab) - 1,)
 
     cache_dir = os.path.dirname(cache_out_path)
     if cache_dir and not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
 
-    np.savez(
-        cache_out_path,
-        tile_tensor=np.stack(tile_rows, axis=0),
-        meta_tensor=np.stack(meta_rows, axis=0),
-        family_target=np.asarray(family_targets, dtype=np.int64),
-        arg1_target=np.asarray(arg1_targets, dtype=np.int64),
-        arg2_target=np.asarray(arg2_targets, dtype=np.int64),
-        reward=np.asarray(rewards, dtype=np.float32),
-        decision_mask=np.asarray(decision_mask, dtype=np.uint8),
-        belief_target=np.stack(belief_rows, axis=0),
-        seen_full_mask=np.stack(seen_mask_rows, axis=0),
-    )
+    temp_root = cache_dir if cache_dir else os.getcwd()
+    scratch_dir = tempfile.mkdtemp(prefix='preencode_', dir=temp_root)
+
+    try:
+        tile_path = os.path.join(scratch_dir, 'tile_tensor.dat')
+        meta_path = os.path.join(scratch_dir, 'meta_tensor.dat')
+        family_path = os.path.join(scratch_dir, 'family_target.dat')
+        arg1_path = os.path.join(scratch_dir, 'arg1_target.dat')
+        arg2_path = os.path.join(scratch_dir, 'arg2_target.dat')
+        reward_path = os.path.join(scratch_dir, 'reward.dat')
+        decision_path = os.path.join(scratch_dir, 'decision_mask.dat')
+        belief_path = os.path.join(scratch_dir, 'belief_target.dat')
+        seen_path = os.path.join(scratch_dir, 'seen_full_mask.dat')
+
+        tile_tensor = np.memmap(tile_path, dtype=np.float32, mode='w+', shape=(kept_count,) + tile_shape)
+        meta_tensor = np.memmap(meta_path, dtype=np.float32, mode='w+', shape=(kept_count,) + meta_shape)
+        family_target = np.memmap(family_path, dtype=np.int64, mode='w+', shape=(kept_count,))
+        arg1_target = np.memmap(arg1_path, dtype=np.int64, mode='w+', shape=(kept_count,))
+        arg2_target = np.memmap(arg2_path, dtype=np.int64, mode='w+', shape=(kept_count,))
+        reward = np.memmap(reward_path, dtype=np.float32, mode='w+', shape=(kept_count,))
+        decision_mask = np.memmap(decision_path, dtype=np.uint8, mode='w+', shape=(kept_count,))
+        belief_target = np.memmap(belief_path, dtype=np.float32, mode='w+', shape=(kept_count,) + belief_shape)
+        seen_full_mask = np.memmap(seen_path, dtype=np.float32, mode='w+', shape=(kept_count,) + seen_shape)
+
+        write_idx = 0
+        for record, legal_actions, dropped_marker in _iter_filtered_records():
+            is_decision = len(legal_actions) > 1
+            tile_encoded, meta_encoded = model._encode_features(record.features)
+            tile_tensor[write_idx] = tile_encoded.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+            meta_tensor[write_idx] = meta_encoded.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+
+            family_idx, arg1_idx, arg2_idx = model.encode_action_targets(record.action)
+            family_target[write_idx] = family_idx
+            arg1_target[write_idx] = arg1_idx
+            arg2_target[write_idx] = arg2_idx
+            reward[write_idx] = float(_safe_float(record.reward, 0.0))
+            decision_mask[write_idx] = 1 if is_decision else 0
+            belief_target[write_idx] = np.asarray(model._belief_target_from_features(record.features), dtype=np.float32)
+
+            seen = record.features.get('seen_counts', []) if isinstance(record.features, dict) else []
+            seen_vec = np.zeros(seen_shape, dtype=np.float32)
+            if isinstance(seen, list):
+                seen_limit = min(len(seen), seen_vec.shape[0])
+                if seen_limit > 0:
+                    seen_slice = np.asarray(seen[:seen_limit], dtype=np.float32)
+                    seen_vec[:seen_limit] = (seen_slice >= 4.0).astype(np.float32)
+            seen_full_mask[write_idx] = seen_vec
+
+            write_idx += 1
+            dropped_forced = dropped_marker
+            if verbose and (write_idx == 1 or write_idx % 1000 == 0 or write_idx == kept_count):
+                _print_progress_bar('preencode', write_idx, kept_count)
+
+        tile_tensor.flush()
+        meta_tensor.flush()
+        family_target.flush()
+        arg1_target.flush()
+        arg2_target.flush()
+        reward.flush()
+        decision_mask.flush()
+        belief_target.flush()
+        seen_full_mask.flush()
+
+        temp_output = cache_out_path + '.tmp.npz'
+        np.savez(
+            temp_output,
+            tile_tensor=np.asarray(tile_tensor),
+            meta_tensor=np.asarray(meta_tensor),
+            family_target=np.asarray(family_target),
+            arg1_target=np.asarray(arg1_target),
+            arg2_target=np.asarray(arg2_target),
+            reward=np.asarray(reward),
+            decision_mask=np.asarray(decision_mask),
+            belief_target=np.asarray(belief_target),
+            seen_full_mask=np.asarray(seen_full_mask),
+        )
+        os.replace(temp_output, cache_out_path)
+
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     summary = {
         'cache_out_path': cache_out_path,
         'dataset_path': dataset_path,
-        'record_count': len(records),
+        'record_count': int(kept_count),
         'dropped_forced_records': int(dropped_forced),
         'decision_only': bool(decision_only),
         'elapsed_seconds': float(time.perf_counter() - start),
@@ -915,7 +978,7 @@ def main():
     preencode_parser.add_argument('--output', required=True, help='Output .npz cache path')
     preencode_parser.add_argument('--max-records', type=int, default=None, help='Optional cap for pre-encoding')
     preencode_parser.add_argument('--decision-only', action='store_true', help='Encode only decision states (legal_actions > 1)')
-    preencode_parser.add_argument('--device', default='cuda', help='Device to use for feature encoding (usually cuda)')
+    preencode_parser.add_argument('--device', default='cpu', help='Device to use for feature encoding (usually cpu)')
     preencode_parser.add_argument('--verbose', action='store_true', help='Print pre-encoding progress')
     preencode_parser.set_defaults(func=_cmd_preencode_cnn)
 
