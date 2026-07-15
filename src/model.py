@@ -190,6 +190,11 @@ class CnnPolicyValueModel:
         self.requested_device = requested_device_name
         self.resolved_device = resolved_device_name
         self.amp_enabled = bool(self.device.type == 'cuda')
+        if self.device.type == 'cuda':
+            try:
+                torch.set_float32_matmul_precision('high')
+            except Exception:
+                pass
         self.amp_dtype = torch.bfloat16
         try:
             self.grad_scaler = torch.amp.GradScaler('cuda', enabled=self.amp_enabled)
