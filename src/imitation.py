@@ -33,6 +33,17 @@ def _safe_float(value, default_value):
         return default_value
 
 
+def _print_progress_bar(prefix, current, total, width=32):
+    total_value = max(1, int(total))
+    current_value = max(0, min(int(current), total_value))
+    ratio = float(current_value) / float(total_value)
+    filled = int(float(width) * ratio)
+    bar = ('#' * filled) + ('-' * (width - filled))
+    print('\r%s [%s] %d/%d (%.1f%%)' % (prefix, bar, current_value, total_value, ratio * 100.0), end='', flush=True)
+    if current_value >= total_value:
+        print('')
+
+
 def _resolve_model_out_path(model_out_path):
     if os.path.isabs(model_out_path):
         return model_out_path
@@ -338,8 +349,8 @@ def preencode_cnn(dataset_path, cache_out_path, max_records=None, decision_only=
                 seen_vec[:limit] = (seen_slice >= 4.0).astype(np.float32)
         seen_mask_rows.append(seen_vec)
 
-        if verbose and ((idx + 1) == 1 or (idx + 1) % 200000 == 0):
-            print('preencode processed=%d/%d' % (idx + 1, len(records)))
+        if verbose and ((idx + 1) == 1 or (idx + 1) % 1000 == 0 or (idx + 1) == len(records)):
+            _print_progress_bar('preencode', idx + 1, len(records))
 
     cache_dir = os.path.dirname(cache_out_path)
     if cache_dir and not os.path.exists(cache_dir):
@@ -503,6 +514,7 @@ def train_cnn(
                 batch_size=batch_size,
                 shuffle=True,
                 verbose=False,
+                show_progress=bool(verbose),
                 policy_weight=policy_weight,
                 value_weight=value_weight,
                 belief_weight=belief_weight,
@@ -518,6 +530,7 @@ def train_cnn(
                 max_records=None,
                 shuffle=True,
                 verbose=False,
+                show_progress=bool(verbose),
                 policy_weight=policy_weight,
                 value_weight=value_weight,
                 belief_weight=belief_weight,

@@ -66,6 +66,17 @@ def _safe_float(value, default_value):
         return default_value
 
 
+def _print_progress_bar(prefix, current, total, width=32):
+    total_value = max(1, int(total))
+    current_value = max(0, min(int(current), total_value))
+    ratio = float(current_value) / float(total_value)
+    filled = int(float(width) * ratio)
+    bar = ('#' * filled) + ('-' * (width - filled))
+    print('\r%s [%s] %d/%d (%.1f%%)' % (prefix, bar, current_value, total_value, ratio * 100.0), end='', flush=True)
+    if current_value >= total_value:
+        print('')
+
+
 def resolve_device(requested_device='cpu'):
     requested = str(requested_device or 'cpu').strip().lower()
     if not requested:
@@ -710,6 +721,7 @@ class CnnPolicyValueModel:
         aux_value_weight=0.15,
         efficiency_weight=0.1,
         belief_consistency_weight=0.1,
+        show_progress=False,
     ):
         total = int(len(preencoded['family_target']))
         batch_size = max(1, int(batch_size))
@@ -737,6 +749,9 @@ class CnnPolicyValueModel:
             if verbose:
                 print('preencoded epoch %d/%d samples=%d batch_size=%d' % (epoch_idx + 1, int(epochs), total, batch_size))
 
+            epoch_label = 'epoch %d/%d' % (epoch_idx + 1, int(epochs))
+            epoch_seen = 0
+
             for start in range(0, total, batch_size):
                 batch_indices = indices[start: start + batch_size]
                 result = self.train_preencoded_batch(
@@ -752,6 +767,12 @@ class CnnPolicyValueModel:
                 )
                 for key in stats:
                     stats[key] += result.get(key, 0)
+                epoch_seen += int(len(batch_indices))
+                if show_progress:
+                    _print_progress_bar(epoch_label, epoch_seen, total)
+
+            if show_progress and epoch_seen < total:
+                _print_progress_bar(epoch_label, total, total)
 
         return stats
 
@@ -1048,6 +1069,7 @@ class CnnPolicyValueModel:
         efficiency_weight=0.1,
         belief_consistency_weight=0.1,
         batch_size=1,
+        show_progress=False,
     ):
         stats = {
             'samples': 0,
@@ -1086,6 +1108,13 @@ class CnnPolicyValueModel:
             effective_batch_size = max(1, int(batch_size))
             pending_batch = []
             epoch_processed = 0
+            epoch_label = 'epoch %d/%d' % (epoch_index + 1, epoch_count)
+            if limit is not None:
+                epoch_total = int(limit)
+            elif hasattr(iterable, '__len__'):
+                epoch_total = int(len(iterable))
+            else:
+                epoch_total = 1
 
             def _flush_pending_batch(current_batch):
                 if not current_batch:
@@ -1123,6 +1152,8 @@ class CnnPolicyValueModel:
                         stats['decision_hits'] += result['action_hit']
                     else:
                         stats['forced_samples'] += 1
+                    if show_progress:
+                        _print_progress_bar(epoch_label, epoch_processed, epoch_total)
                     return
 
                 batch_result = self.train_batch_step(
@@ -1147,6 +1178,8 @@ class CnnPolicyValueModel:
                 stats['decision_samples'] += batch_result.get('decision_samples', 0)
                 stats['decision_hits'] += batch_result.get('decision_hits', 0)
                 stats['forced_samples'] += batch_result.get('forced_samples', 0)
+                if show_progress:
+                    _print_progress_bar(epoch_label, epoch_processed, epoch_total)
 
             for record in iterable:
                 if limit is not None and (stats['samples'] + len(pending_batch)) >= limit:
@@ -1165,6 +1198,9 @@ class CnnPolicyValueModel:
 
             if pending_batch:
                 _flush_pending_batch(pending_batch)
+
+            if show_progress and epoch_processed < epoch_total:
+                _print_progress_bar(epoch_label, epoch_total, epoch_total)
 
             if verbose and stats['samples'] > 0:
                 epoch_samples = stats['samples'] - epoch_start_samples
