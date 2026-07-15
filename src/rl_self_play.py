@@ -23,6 +23,17 @@ def _safe_float(value, default_value):
         return default_value
 
 
+def _print_progress_bar(prefix, current, total, width=32):
+    total_value = max(1, int(total))
+    current_value = max(0, min(int(current), total_value))
+    ratio = float(current_value) / float(total_value)
+    filled = int(float(width) * ratio)
+    bar = ('#' * filled) + ('-' * (width - filled))
+    print('\r%s [%s] %d/%d (%.1f%%)' % (prefix, bar, current_value, total_value, ratio * 100.0), end='', flush=True)
+    if current_value >= total_value:
+        print('')
+
+
 def _load_external_opponents(registry_path):
     if not registry_path:
         return []
@@ -270,7 +281,9 @@ def run_ppo_fine_tuning(
         'draws': 0,
     }
 
-    for episode_index in range(max(0, _safe_int(games, 0))):
+    total_episodes = max(0, _safe_int(games, 0))
+
+    for episode_index in range(total_episodes):
         buffer = EpisodeBuffer()
 
         def policy_factory(state):
@@ -316,6 +329,7 @@ def run_ppo_fine_tuning(
             train_summary['ratio'] += update['ratio']
 
         train_summary['episodes'] += 1
+    _print_progress_bar('ppo-train', train_summary['episodes'], total_episodes)
 
     model.save(model_path)
     train_summary['evaluation'] = evaluate_against_baseline(
