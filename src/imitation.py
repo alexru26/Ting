@@ -277,12 +277,14 @@ def train_cnn(
     device='auto',
     early_stopping_patience=2,
     early_stopping_min_delta=0.0,
+    batch_size=256,
 ):
     train_start = time.perf_counter()
 
     if verbose:
         print('starting train_cnn dataset=%s out=%s epochs=%d hidden_size=%d decision_only=%s device=%s max_records=%s'
               % (dataset_path, model_out_path, int(epochs), int(hidden_size), str(bool(decision_only)), str(device), str(max_records)))
+        print('training configuration batch_size=%d early_stopping_patience=%d early_stopping_min_delta=%.6f' % (int(batch_size), int(early_stopping_patience), float(early_stopping_min_delta)))
 
     model_init_start = time.perf_counter()
     model_out_path = _resolve_model_out_path(model_out_path)
@@ -294,14 +296,30 @@ def train_cnn(
         device=device,
     )
     if verbose:
-        print('model initialized resolved_device=%s elapsed=%.2fs' % (model.resolved_device, time.perf_counter() - model_init_start))
+        print('model initialized resolved_device=%s amp_enabled=%s elapsed=%.2fs' % (model.resolved_device, str(bool(model.amp_enabled)), time.perf_counter() - model_init_start))
 
     data_prep_start = time.perf_counter()
+    requested_decision_only = bool(decision_only)
+    effective_decision_only = requested_decision_only
+    decision_only_fallback_used = False
+
     records, dropped_forced = _collect_training_records(
         dataset_path,
         max_records=max_records,
-        decision_only=decision_only,
+        decision_only=effective_decision_only,
     )
+
+    if effective_decision_only and not records:
+        decision_only_fallback_used = True
+        effective_decision_only = False
+        if verbose:
+            print('decision-only filtering produced zero records; falling back to full-data training mode')
+        records, _ = _collect_training_records(
+            dataset_path,
+            max_records=max_records,
+            decision_only=False,
+        )
+
     if verbose:
         prepared_count = len(records) if isinstance(records, list) else 'stream'
         print('data preparation done records=%s dropped_forced=%d elapsed=%.2fs' % (str(prepared_count), int(dropped_forced), time.perf_counter() - data_prep_start))
@@ -345,6 +363,7 @@ def train_cnn(
             aux_value_weight=0.15,
             efficiency_weight=0.0 if ablate_efficiency else 0.1,
             belief_consistency_weight=0.0 if ablate_belief else 0.1,
+            batch_size=batch_size,
         )
         stats = _merge_training_stats(stats, epoch_stats)
         epochs_trained += 1
@@ -405,10 +424,13 @@ def train_cnn(
             'learning_rate': float(learning_rate),
             'max_records': None if max_records is None else int(max_records),
             'verbose': bool(verbose),
-            'decision_only': bool(decision_only),
+            'decision_only': bool(effective_decision_only),
+            'decision_only_requested': bool(requested_decision_only),
+            'decision_only_fallback_used': bool(decision_only_fallback_used),
             'train_record_count': int(len(train_records)),
             'validation_record_count': int(len(validation_records)),
             'train_split_ratio': 0.8,
+            'batch_size': int(batch_size),
             'policy_weight': float(policy_weight),
             'value_weight': float(value_weight),
             'belief_weight': float(belief_weight),
@@ -426,6 +448,7 @@ def train_cnn(
             'package_profile': package_profile(),
             'requested_device': model.requested_device,
             'resolved_device': model.resolved_device,
+            'mixed_precision_enabled': bool(model.amp_enabled),
             'early_stopping': {
                 'enabled': True,
                 'patience': int(patience_value),
@@ -587,6 +610,7 @@ def _cmd_train_cnn(args):
         device=args.device,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        batch_size=args.batch_size,
     )
     summary = {
         'model_type': result.get('model_type'),
@@ -682,6 +706,7 @@ def main():
     train_cnn_parser.add_argument('--device', default='auto', help='Torch device: cpu, cuda, cuda:0, or auto')
     train_cnn_parser.add_argument('--early-stopping-patience', type=int, default=2, help='Stop if validation loss does not improve for N epochs')
     train_cnn_parser.add_argument('--early-stopping-min-delta', type=float, default=0.0, help='Minimum validation loss improvement required to reset patience')
+    train_cnn_parser.add_argument('--batch-size', type=int, default=256, help='Supervised training batch size')
     train_cnn_parser.set_defaults(func=_cmd_train_cnn)
 
     eval_cnn_parser = sub.add_parser('eval-cnn', help='Evaluate CNN policy-value model on JSONL trajectory dataset')
