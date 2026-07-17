@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 import io
-from typing import Optional
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
@@ -75,7 +74,7 @@ class _FakePpoGame:
 
 
 class _FakeLeagueGame:
-    last_policy_types: Optional[list[str]] = None
+    last_policy_types = None
 
     def __init__(self, quan=0, seed=None, policy_factory=None):
         self.quan = quan
@@ -83,7 +82,7 @@ class _FakeLeagueGame:
         self.policy_factory = policy_factory
 
     def run(self):
-        policies: list[str] = []
+        policies = []
         assert self.policy_factory is not None
         for seat in range(4):
             policy = self.policy_factory(_FakeState(my_id=seat))

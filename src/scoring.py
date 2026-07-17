@@ -3,14 +3,11 @@ from enum import Enum, auto
 
 from tiles import NUMBERED_SUITS, best_discard, is_honor, min_shanten, shanten_pairs, shanten_standard
 
-try:
-    from MahjongGB import MahjongFanCalculator as _FanCalc
-except ImportError:
-    _FanCalc = None
+from MahjongGB import MahjongFanCalculator as _FanCalc
 
 
 def fan_calculator_available():
-    return _FanCalc is not None
+    return True
 
 
 class GoalType(Enum):
@@ -42,26 +39,20 @@ def calculate_fan(
     seat_wind,
     prevalent_wind,
 ):
-    """Return total fan count, or 0 on error / unavailable calculator."""
-    if _FanCalc is None:
-        return 0
-
-    try:
-        result = _FanCalc(
-            packs,
-            hand,
-            win_tile,
-            flower_count,
-            is_self_drawn,
-            is_4th_tile,
-            is_about_kong,
-            is_wall_last,
-            seat_wind,
-            prevalent_wind,
-        )
-        return sum(fan_val for fan_val, _ in result)
-    except Exception:
-        return 0
+    """Return total fan count using MahjongGB calculator."""
+    result = _FanCalc(
+        packs,
+        hand,
+        win_tile,
+        flower_count,
+        is_self_drawn,
+        is_4th_tile,
+        is_about_kong,
+        is_wall_last,
+        seat_wind,
+        prevalent_wind,
+    )
+    return sum(fan_val for fan_val, _ in result)
 
 
 def can_win(
@@ -75,19 +66,22 @@ def can_win(
     is_about_kong=False,
 ):
     """Return True if the hand is a valid winning hand (>=8 fan)."""
-    fan = calculate_fan(
-        packs,
-        tuple(hand),
-        win_tile,
-        flower_count,
-        is_self_drawn,
-        False,
-        is_about_kong,
-        False,
-        seat_wind,
-        prevalent_wind,
-    )
-    return fan >= 8
+    try:
+        fan = calculate_fan(
+            packs,
+            tuple(hand),
+            win_tile,
+            flower_count,
+            is_self_drawn,
+            False,
+            is_about_kong,
+            False,
+            seat_wind,
+            prevalent_wind,
+        )
+        return fan >= 8
+    except Exception:
+        return False
 
 
 def _tiles_for_pure_flush(hand):

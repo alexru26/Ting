@@ -27,7 +27,7 @@ class TestFeatureExtractor(unittest.TestCase):
     def test_feature_shapes(self):
         extractor = FeatureExtractor()
         features = extractor.extract(self._make_state())
-        self.assertEqual(features['schema_version'], 2)
+        self.assertEqual(features['schema_version'], 3)
         self.assertEqual(len(features['hand_counts']), 34)
         self.assertEqual(len(features['seen_counts']), 34)
         self.assertEqual(len(features['self_discard_counts']), 34)
@@ -38,6 +38,15 @@ class TestFeatureExtractor(unittest.TestCase):
         self.assertIn('hand_shanten_norm', features)
         self.assertIn('acceptancy_norm', features)
         self.assertIn('action_efficiency_deltas', features)
+        self.assertIn('request_type', features)
+        self.assertIn('seat', features)
+        self.assertIn('target_player', features)
+        self.assertIn('event_action', features)
+        self.assertIn('raw_request', features)
+        self.assertIn('fan_if_hu_now_norm', features)
+        self.assertIn('is_tenpai', features)
+        self.assertIn('wait_count_norm', features)
+        self.assertIn('action_fan_deltas', features)
         self.assertEqual(len(features['meta']), 8)
 
     def test_normalization_invariants(self):
@@ -46,6 +55,11 @@ class TestFeatureExtractor(unittest.TestCase):
         for key in ['hand_counts_norm', 'seen_counts_norm', 'self_discard_counts_norm', 'pack_counts_norm']:
             self.assertTrue(all(0.0 <= value <= 1.0 for value in features[key]))
         self.assertTrue(-1.0 <= features['action_efficiency_deltas']['PLAY'] <= 1.0)
+        for family in ['PASS', 'HU', 'GANG', 'PLAY', 'BUGANG', 'PENG', 'CHI']:
+            self.assertIn(family, features['action_fan_deltas'])
+            self.assertTrue(-1.0 <= features['action_fan_deltas'][family] <= 1.0)
+        self.assertTrue(0.0 <= features['fan_if_hu_now_norm'] <= 1.0)
+        self.assertTrue(0.0 <= features['wait_count_norm'] <= 1.0)
 
     def test_temporal_uses_full_history_lengths(self):
         extractor = FeatureExtractor()

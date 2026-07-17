@@ -5,7 +5,9 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, 'src'))
 from local_game import run_games, render_tui_board
 
 class TestLocalGameOutput(unittest.TestCase):

@@ -37,6 +37,16 @@ class TestLegalActionAgreement(unittest.TestCase):
         gs.last_actor = 3
         return gs
 
+    def _make_bugang_state(self):
+        gs = GameState()
+        gs.my_id = 0
+        gs.hand = ['W1', 'W2', 'W3', 'B1', 'B2', 'B3', 'T1', 'T2', 'T3', 'J1', 'J1', 'F1', 'F2']
+        gs.last_request_type = 3
+        gs.last_request_action = 'BUGANG'
+        gs.last_tile = 'W3'
+        gs.last_actor = 1
+        return gs
+
     def _assert_agreement(self, gs):
         codec = ActionCodec()
         bot = MahjongBot()
@@ -54,6 +64,14 @@ class TestLegalActionAgreement(unittest.TestCase):
     def test_play_state_agreement(self):
         self._assert_agreement(self._make_play_state())
 
+    def test_bugang_state_allows_hu(self):
+        state = self._make_bugang_state()
+        legal = set(state.enumerate_legal_actions())
+        self.assertIn('HU', legal)
+        bot = MahjongBot()
+        self.assertTrue(bot._is_legal_action(state, 'HU'))
+        self.assertTrue(bot._is_legal_action(state, 'PASS'))
+
 class TestSimulatorDatasetExport(unittest.TestCase):
 
     def test_run_games_export_dataset(self):
@@ -67,6 +85,11 @@ class TestSimulatorDatasetExport(unittest.TestCase):
             payload = json.loads(first)
             self.assertIn('action', payload)
             self.assertIn('features', payload)
+            self.assertIn('request_type', payload['features'])
+            self.assertIn('seat', payload['features'])
+            self.assertIn('target_player', payload['features'])
+            self.assertIn('event_action', payload['features'])
+            self.assertIn('raw_request', payload['features'])
 
 
 class _AdaptiveStubModel:

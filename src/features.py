@@ -1,12 +1,14 @@
 import math
 
 from tiles import ALL_TILES, TILE_TO_IDX
-from tiles import min_shanten, useful_tiles
+from tiles import NUMBERED_SUITS, min_shanten, tile_value, useful_tiles
+from scoring import calculate_fan
 
 
-FEATURE_SCHEMA_VERSION = 2
+FEATURE_SCHEMA_VERSION = 3
 _COUNT_NORM_DIVISOR = 4.0
 _DELTA_NORM_SCALE = 2.0
+_FAN_NORM_DIVISOR = 16.0
 
 
 _LAST_ACTION_TO_ID = {
@@ -48,6 +50,9 @@ class FeatureExtractor:
         hand_shanten = self._safe_shanten(state.hand, len(state.packs))
         hand_acceptancy = self._acceptancy_count(state.hand, len(state.packs))
         efficiency_deltas = self._action_efficiency_deltas(state.hand, len(state.packs))
+        fan_now, can_hu_now = self._fan_now(state)
+        tenpai = self._tenpai_profile(state, state.hand, len(state.packs))
+        action_fan_values, action_fan_deltas = self._action_conditioned_fan_features(state, tenpai)
 
         hand_counts_norm = self._normalize_count_bucket(hand_counts)
         seen_counts_norm = self._normalize_count_bucket(seen_counts)
@@ -68,6 +73,11 @@ class FeatureExtractor:
 
         return {
             'schema_version': FEATURE_SCHEMA_VERSION,
+            'request_type': int(state.last_request_type),
+            'seat': int(state.my_id),
+            'target_player': True,
+            'event_action': state.last_request_action,
+            'raw_request': state.last_request_action,
             'hand_counts': hand_counts,
             'seen_counts': seen_counts,
             'self_discard_counts': self_discard_counts,
@@ -83,9 +93,219 @@ class FeatureExtractor:
             'hand_shanten_norm': self.normalize_count_like(hand_shanten),
             'acceptancy': hand_acceptancy,
             'acceptancy_norm': self.normalize_count_like(hand_acceptancy),
+            'can_hu_now': 1.0 if can_hu_now else 0.0,
+            'fan_if_hu_now': fan_now,
+            'fan_if_hu_now_norm': self.normalize_fan(fan_now),
+            'fan_gap_to_8': max(0.0, 8.0 - float(fan_now)),
+            'fan_gap_to_8_norm': self.normalize_fan(max(0.0, 8.0 - float(fan_now))),
+            'is_tenpai': 1.0 if tenpai['is_tenpai'] else 0.0,
+            'wait_count': tenpai['wait_count'],
+            'wait_count_norm': self.normalize_count_like(tenpai['wait_count']),
+            'wait_fan_min': tenpai['wait_fan_min'],
+            'wait_fan_max': tenpai['wait_fan_max'],
+            'wait_fan_mean': tenpai['wait_fan_mean'],
+            'wait_fan_min_norm': self.normalize_fan(tenpai['wait_fan_min']),
+            'wait_fan_max_norm': self.normalize_fan(tenpai['wait_fan_max']),
+            'wait_fan_mean_norm': self.normalize_fan(tenpai['wait_fan_mean']),
             'action_efficiency_deltas': efficiency_deltas,
+            'action_fan_values': action_fan_values,
+            'action_fan_deltas': action_fan_deltas,
             'meta': meta,
         }
+
+    def _fan_now(self, state):
+        request_type = int(state.last_request_type)
+        request_action = state.last_request_action
+        tile = state.last_tile
+        if not tile:
+            return 0.0, False
+
+        hand = list(state.hand)
+        is_self_drawn = bool(request_type == 2)
+        is_about_kong = bool(request_type == 3 and request_action == 'BUGANG')
+        if is_self_drawn and tile in hand:
+            hand.remove(tile)
+        if not self._can_score_hand_shape(hand, len(state.packs)):
+            return 0.0, False
+
+        try:
+            fan = float(
+                calculate_fan(
+                    state.fan_calc_packs(),
+                    tuple(hand),
+                    tile,
+                    int(state.flowers),
+                    is_self_drawn,
+                    False,
+                    is_about_kong,
+                    False,
+                    int(state.my_id) % 4,
+                    int(state.quan),
+                )
+            )
+        except Exception:
+            fan = 0.0
+        return fan, fan >= 8.0
+
+    def _wait_fans_for_hand(self, state, hand, meld_count):
+        shanten = self._safe_shanten(hand, meld_count)
+        if shanten > 0:
+            return []
+        if not self._can_score_hand_shape(hand, meld_count):
+            return []
+
+        fans = []
+        packs = state.fan_calc_packs()
+        for tile in ALL_TILES:
+            seen = float(state.seen_tiles.get(tile, 0))
+            if seen >= 4.0:
+                continue
+            try:
+                fan = float(
+                    calculate_fan(
+                        packs,
+                        tuple(hand),
+                        tile,
+                        int(state.flowers),
+                        False,
+                        False,
+                        False,
+                        False,
+                        int(state.my_id) % 4,
+                        int(state.quan),
+                    )
+                )
+            except Exception:
+                fan = 0.0
+            if fan > 0.0:
+                fans.append(fan)
+        return fans
+
+    def _tenpai_profile(self, state, hand, meld_count):
+        fans = self._wait_fans_for_hand(state, hand, meld_count)
+        if not fans:
+            return {
+                'is_tenpai': False,
+                'wait_count': 0,
+                'wait_fan_min': 0.0,
+                'wait_fan_max': 0.0,
+                'wait_fan_mean': 0.0,
+            }
+
+        return {
+            'is_tenpai': True,
+            'wait_count': int(len(fans)),
+            'wait_fan_min': float(min(fans)),
+            'wait_fan_max': float(max(fans)),
+            'wait_fan_mean': float(sum(fans) / float(len(fans))),
+        }
+
+    def _best_wait_mean_after_discard(self, state, hand, meld_count):
+        if not hand:
+            return 0.0
+        best = None
+        for tile in set(hand):
+            reduced = list(hand)
+            try:
+                reduced.remove(tile)
+            except ValueError:
+                continue
+            profile = self._tenpai_profile(state, reduced, meld_count)
+            value = float(profile['wait_fan_mean'])
+            if best is None or value > best:
+                best = value
+        if best is None:
+            return 0.0
+        return float(best)
+
+    def _best_peng_wait_mean(self, state):
+        if state.last_request_type != 3 or state.last_request_action != 'PLAY' or not state.last_tile:
+            return 0.0
+        tile = state.last_tile
+        hand = list(state.hand)
+        if hand.count(tile) < 2:
+            return 0.0
+        hand.remove(tile)
+        hand.remove(tile)
+        return self._best_wait_mean_after_discard(state, hand, len(state.packs) + 1)
+
+    def _best_chi_wait_mean(self, state):
+        if state.last_request_type != 3 or state.last_request_action != 'PLAY' or not state.last_tile:
+            return 0.0
+        tile = state.last_tile
+        if tile[0] not in NUMBERED_SUITS:
+            return 0.0
+        if state.last_actor is None or (int(state.last_actor) + 1) % 4 != int(state.my_id):
+            return 0.0
+
+        suit = tile[0]
+        value = tile_value(tile)
+        best = None
+        for mid in range(max(2, value - 1), min(8, value + 1) + 1):
+            seq = ['%s%d' % (suit, mid - 1), '%s%d' % (suit, mid), '%s%d' % (suit, mid + 1)]
+            if tile not in seq:
+                continue
+            needed = [t for t in seq if t != tile]
+            hand = list(state.hand)
+            if not all(t in hand for t in needed):
+                continue
+            for needed_tile in needed:
+                hand.remove(needed_tile)
+            score = self._best_wait_mean_after_discard(state, hand, len(state.packs) + 1)
+            if best is None or score > best:
+                best = score
+        if best is None:
+            return 0.0
+        return float(best)
+
+    @staticmethod
+    def _can_score_hand_shape(hand, meld_count):
+        expected = 13 - 3 * int(meld_count)
+        if expected < 1:
+            expected = 1
+        return len(list(hand or [])) == expected
+
+    def _best_gang_wait_mean(self, state):
+        hand = list(state.hand)
+        base_meld_count = len(state.packs)
+        best = None
+
+        for tile in set(hand):
+            if hand.count(tile) >= 4:
+                reduced = [item for item in hand if item != tile]
+                score = self._tenpai_profile(state, reduced, base_meld_count + 1)['wait_fan_mean']
+                if best is None or score > best:
+                    best = score
+
+        peng_tiles = {ptile for ptype, ptile, _ in state.packs if ptype == 'PENG'}
+        for tile in peng_tiles:
+            if tile in hand:
+                reduced = list(hand)
+                reduced.remove(tile)
+                score = self._tenpai_profile(state, reduced, base_meld_count + 1)['wait_fan_mean']
+                if best is None or score > best:
+                    best = score
+
+        if best is None:
+            return 0.0
+        return float(best)
+
+    def _action_conditioned_fan_features(self, state, tenpai_profile):
+        baseline = float(tenpai_profile.get('wait_fan_mean', 0.0))
+        fan_now, _can_hu_now = self._fan_now(state)
+        values = {
+            'PASS': baseline,
+            'HU': float(fan_now),
+            'PLAY': self._best_wait_mean_after_discard(state, list(state.hand), len(state.packs)),
+            'GANG': self._best_gang_wait_mean(state),
+            'BUGANG': self._best_gang_wait_mean(state),
+            'PENG': self._best_peng_wait_mean(state),
+            'CHI': self._best_chi_wait_mean(state),
+        }
+        deltas = {}
+        for family, value in values.items():
+            deltas[family] = self.normalize_delta(float(value) - baseline, scale=4.0)
+        return values, deltas
 
     def _safe_shanten(self, hand, meld_count):
         try:
@@ -184,6 +404,11 @@ class FeatureExtractor:
     def normalize_count_like(value):
         value = float(value)
         return min(1.0, max(0.0, value / _COUNT_NORM_DIVISOR))
+
+    @staticmethod
+    def normalize_fan(value):
+        value = float(value)
+        return min(1.0, max(0.0, value / _FAN_NORM_DIVISOR))
 
     @staticmethod
     def normalize_delta(value, scale=_DELTA_NORM_SCALE):
