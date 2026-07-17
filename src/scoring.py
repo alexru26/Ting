@@ -9,6 +9,10 @@ except ImportError:
     _FanCalc = None
 
 
+def fan_calculator_available():
+    return _FanCalc is not None
+
+
 class GoalType(Enum):
     STANDARD = auto()
     SEVEN_PAIRS = auto()

@@ -19,7 +19,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple, cast
 from dataset import JsonlTrajectoryWriter, TrajectoryRecord
 from features import FeatureExtractor
-from scoring import calculate_fan
+from scoring import calculate_fan, fan_calculator_available
 from state import GameState
 from policy import GoalBasedPolicy, create_policy
 from tiles import ALL_TILES, normalize_tiles
@@ -468,6 +468,8 @@ def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.0
     draws = 0
     writer = None
     show_dataset_progress = bool(export_dataset_path) and n > 1
+    if not fan_calculator_available():
+        print('WARNING: MahjongGB fan calculator is unavailable. Win validation will fail and games are likely to end in draws.')
     opponent_pool = _load_opponent_registry(opponent_registry_path)
     if export_dataset_path:
         writer = JsonlTrajectoryWriter(export_dataset_path)
