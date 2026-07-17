@@ -64,7 +64,9 @@ class MahjongBot:
                 if verb == 'CHI' and len(parts) == 3:
                     return self._can_chi(state, parts[1], parts[2])
                 return False
-            if request_action in ('GANG', 'BUGANG', 'PENG', 'CHI', 'DRAW', 'BUHUA'):
+            if request_action == 'BUGANG':
+                return verb in ('PASS', 'HU')
+            if request_action in ('GANG', 'PENG', 'CHI', 'DRAW', 'BUHUA'):
                 return verb == 'PASS'
         return verb == 'PASS'
 

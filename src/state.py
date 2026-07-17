@@ -375,7 +375,9 @@ class GameState:
                     for mid_tile in self._valid_chi_mids(last_tile):
                         for discard in normalize_tiles(list(set(self.hand))):
                             actions.append('CHI %s %s' % (mid_tile, discard))
-            elif request_action in ('GANG', 'BUGANG', 'PENG', 'CHI', 'DRAW', 'BUHUA'):
+            elif request_action == 'BUGANG':
+                actions.extend(['PASS', 'HU'])
+            elif request_action in ('GANG', 'PENG', 'CHI', 'DRAW', 'BUHUA'):
                 actions.append('PASS')
         else:
             actions.append('PASS')

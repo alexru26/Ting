@@ -51,12 +51,16 @@ REQUEST_VOCAB = [
     'PASS',
 ]
 
+ACTION_FAMILY_ORDER = ['PASS', 'HU', 'GANG', 'PLAY', 'BUGANG', 'PENG', 'CHI']
+
 
 TILE_COUNT = len(ALL_TILES)
 CHANNEL_COUNT = 11
 TEMPORAL_FEATURES_PER_OPPONENT = 7
 TEMPORAL_OPPONENT_COUNT = 3
-EXTRA_META_COUNT = 1 + 1 + 3 + (TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT)
+ACTION_CONDITIONED_META_COUNT = len(ACTION_FAMILY_ORDER)
+FAN_TENPAI_META_COUNT = 8
+EXTRA_META_COUNT = 1 + 1 + 3 + FAN_TENPAI_META_COUNT + ACTION_CONDITIONED_META_COUNT + (TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT)
 META_COUNT = 8 + 3 + len(EVENT_VOCAB) + len(REQUEST_VOCAB) + EXTRA_META_COUNT
 INPUT_SIZE = TILE_COUNT * CHANNEL_COUNT + META_COUNT
 
@@ -368,6 +372,23 @@ class CnnPolicyValueModel:
                 _safe_float((features.get('action_efficiency_deltas') or {}).get('GANG', 0.0), 0.0),
             ]
         )
+        meta_values.extend(
+            [
+                _safe_float(features.get('can_hu_now', 0.0), 0.0),
+                _safe_float(features.get('fan_if_hu_now_norm', 0.0), 0.0),
+                _safe_float(features.get('fan_gap_to_8_norm', 0.0), 0.0),
+                _safe_float(features.get('is_tenpai', 0.0), 0.0),
+                _safe_float(features.get('wait_count_norm', 0.0), 0.0),
+                _safe_float(features.get('wait_fan_min_norm', 0.0), 0.0),
+                _safe_float(features.get('wait_fan_max_norm', 0.0), 0.0),
+                _safe_float(features.get('wait_fan_mean_norm', 0.0), 0.0),
+            ]
+        )
+        action_fan_deltas = features.get('action_fan_deltas', {})
+        if not isinstance(action_fan_deltas, dict):
+            action_fan_deltas = {}
+        for family in ACTION_FAMILY_ORDER:
+            meta_values.append(_safe_float(action_fan_deltas.get(family, 0.0), 0.0))
         meta_values.extend(self._extract_temporal_meta(features))
 
         while len(meta_values) < META_COUNT:
