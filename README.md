@@ -19,7 +19,7 @@ python src/local_game.py --games 100 --opponent-registry data/OPPONENTS.json --r
 ### 2. Supervised pretraining
 
 ```bash
-python src/imitation.py preencode-cnn --dataset data/DATA.jsonl --output data/DATA.preencoded.npz --decision-only --device cpu
+python src/imitation.py preencode-cnn --dataset data/DATA.jsonl --output data/DATA.preencoded.npz --device cpu
 ```
 
 ```bash
