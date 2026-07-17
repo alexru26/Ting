@@ -392,6 +392,8 @@ def run_ppo_fine_tuning(
     }
 
     total_episodes = max(0, _safe_int(games, 0))
+    if total_episodes > 0:
+        _print_progress_bar('ppo-train', 0, total_episodes)
 
     for episode_index in range(total_episodes):
         buffer = EpisodeBuffer()
@@ -444,7 +446,7 @@ def run_ppo_fine_tuning(
             train_summary['ratio'] += update['ratio']
 
         train_summary['episodes'] += 1
-    _print_progress_bar('ppo-train', train_summary['episodes'], total_episodes)
+        _print_progress_bar('ppo-train', train_summary['episodes'], total_episodes)
 
     model.save(model_path)
     train_summary['evaluation'] = evaluate_against_baseline(
