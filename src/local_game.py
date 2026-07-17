@@ -38,6 +38,14 @@ def _format_packs(packs):
         return '-'
     return ' | '.join([f'{ptype}:{tile}@{offer}' for ptype, tile, offer in packs])
 
+
+def _format_progress_line(completed, total, bar_width=28):
+    total_games = max(1, int(total))
+    done_games = max(0, min(int(completed), total_games))
+    filled = int(bar_width * done_games / total_games)
+    bar = '#' * filled + '-' * (bar_width - filled)
+    return f'\rDataset progress [{bar}] {done_games}/{total_games} games completed'
+
 def render_tui_board(state, game_index, total_games, clear_screen=True):
     typed_state = cast(Dict[str, Any], state)
     if clear_screen:
@@ -459,9 +467,12 @@ def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.0
     total_fan = defaultdict(int)
     draws = 0
     writer = None
+    show_dataset_progress = bool(export_dataset_path) and n > 1
     opponent_pool = _load_opponent_registry(opponent_registry_path)
     if export_dataset_path:
         writer = JsonlTrajectoryWriter(export_dataset_path)
+        if show_dataset_progress:
+            print(f'Generating dataset at {export_dataset_path}')
     try:
         for i in range(n):
             game_seed = None if seed is None else seed + i
@@ -504,9 +515,13 @@ def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.0
                     print(f"    discards ({len(player_state['discards'])}): {player_state['discards']}")
                     print(f"    packs: {player_state['packs']}")
                     print(f"    flowers ({len(player_state['flowers'])}): {player_state['flowers']}")
+            elif show_dataset_progress:
+                print(_format_progress_line(i + 1, n), end='', flush=True)
     finally:
         if writer is not None:
             writer.close()
+        if show_dataset_progress:
+            print()
     if n > 1:
         print(f"\n{'=' * 40}")
         print(f'Games: {n}  Draws: {draws}')

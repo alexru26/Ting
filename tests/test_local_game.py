@@ -2,6 +2,7 @@
 import io
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -46,5 +47,20 @@ class TestLocalGameOutput(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn('Local Mahjong TUI', out)
         self.assertIn('Final result:', out)
+
+    def test_dataset_export_shows_progress(self):
+        path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jsonl') as handle:
+                path = handle.name
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                run_games(n=2, seed=42, export_dataset_path=path)
+            out = buf.getvalue()
+            self.assertIn('Generating dataset at', out)
+            self.assertIn('2/2 games completed', out)
+        finally:
+            if path and os.path.exists(path):
+                os.remove(path)
 if __name__ == '__main__':
     unittest.main()
