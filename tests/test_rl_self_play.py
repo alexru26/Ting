@@ -50,6 +50,9 @@ class _FakeState:
     def enumerate_legal_actions(self):
         return ['PASS', 'PLAY W1', 'PLAY W2']
 
+    def is_legal_action(self, action):
+        return action in self.enumerate_legal_actions()
+
 
 class _FakePpoGame:
     call_count = 0
@@ -64,6 +67,25 @@ class _FakePpoGame:
         policy = self.policy_factory(state)
         _ = policy.choose_action()
         _FakePpoGame.call_count += 1
+        return {'winner': 0, 'fan': 8, 'scores': [24, -8, -8, -8]}
+
+
+class _FakeLeagueGame:
+    last_policy_types = None
+
+    def __init__(self, quan=0, seed=None, policy_factory=None):
+        self.quan = quan
+        self.seed = seed
+        self.policy_factory = policy_factory
+
+    def run(self):
+        policies = []
+        for seat in range(4):
+            policy = self.policy_factory(_FakeState(my_id=seat))
+            policies.append(type(policy).__name__)
+            if seat == 0:
+                _ = policy.choose_action()
+        _FakeLeagueGame.last_policy_types = policies
         return {'winner': 0, 'fan': 8, 'scores': [24, -8, -8, -8]}
 
 
@@ -152,6 +174,61 @@ class TestRlSelfPlay(unittest.TestCase):
             self.assertEqual(summary['requested_device'], 'auto')
             self.assertIn(summary['resolved_device'], ['cpu', 'cuda'])
             self.assertTrue(os.path.exists(model_path))
+
+    def test_ppo_fine_tuning_uses_registry_opponents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate_path = os.path.join(tmp, 'candidate.h5')
+            opponent_path = os.path.join(tmp, 'opponent.h5')
+            registry_path = os.path.join(tmp, 'opponents_registry.json')
+
+            codec = ActionCodec()
+            candidate = CnnPolicyValueModel(
+                action_space_size=codec.size,
+                hidden_size=8,
+                learning_rate=0.01,
+            )
+            candidate.save(candidate_path)
+
+            opponent = CnnPolicyValueModel(
+                action_space_size=codec.size,
+                hidden_size=8,
+                learning_rate=0.01,
+            )
+            opponent.save(opponent_path)
+
+            with open(registry_path, 'w', encoding='utf-8') as handle:
+                json.dump(
+                    {
+                        'count': 1,
+                        'opponents': [
+                            {
+                                'id': 'ext-a',
+                                'path': opponent_path,
+                                'policy_mode': 'imitation',
+                            }
+                        ],
+                    },
+                    handle,
+                )
+
+            _FakeLeagueGame.last_policy_types = None
+            summary = run_ppo_fine_tuning(
+                model_path=candidate_path,
+                games=1,
+                seed=11,
+                eval_games=0,
+                candidate_seat=0,
+                game_factory=_FakeLeagueGame,
+                promote_min_win_rate=0.5,
+                promote_min_avg_score_delta=0.0,
+                device='auto',
+                opponent_registry_path=registry_path,
+            )
+
+            self.assertEqual(summary['episodes'], 1)
+            self.assertIsNotNone(_FakeLeagueGame.last_policy_types)
+            self.assertIn('PpoPolicy', _FakeLeagueGame.last_policy_types)
+            self.assertTrue(any(policy_type not in ('GoalBasedPolicy', 'PpoPolicy') for policy_type in _FakeLeagueGame.last_policy_types))
 
     def test_promotion_gate_checks_metrics(self):
         accepted = promotion_gate({'games': 10, 'candidate_win_rate': 0.6, 'avg_score_delta': 1.0}, min_win_rate=0.55, min_avg_score_delta=0.0)
