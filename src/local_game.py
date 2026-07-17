@@ -10,6 +10,8 @@ Usage
     python local_game.py --games 100  # run N games and print win statistics
 """
 import argparse
+import json
+import os
 import random
 import time
 import uuid
@@ -19,7 +21,7 @@ from dataset import JsonlTrajectoryWriter, TrajectoryRecord
 from features import FeatureExtractor
 from scoring import calculate_fan
 from state import GameState
-from policy import GoalBasedPolicy
+from policy import GoalBasedPolicy, create_policy
 from tiles import ALL_TILES, normalize_tiles
 FLOWER_TILES = [f'H{i}' for i in range(1, 9)]
 
@@ -64,6 +66,60 @@ def _build_wall():
     wall.extend(FLOWER_TILES)
     random.shuffle(wall)
     return wall
+
+
+def _load_opponent_registry(registry_path):
+    if not registry_path:
+        return []
+    if not os.path.exists(registry_path):
+        return []
+
+    with open(registry_path, 'r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+
+    rows = payload.get('opponents', []) if isinstance(payload, dict) else []
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        result.append(
+            {
+                'id': row.get('id') or row.get('file_name') or 'external-opponent',
+                'kind': 'external',
+                'path': row.get('path') or row.get('file_name'),
+                'policy_mode': row.get('policy_mode', 'imitation'),
+            }
+        )
+    return result
+
+
+def _sample_opponent_rows(pool, seat_count, rng):
+    seat_count = max(0, int(seat_count))
+    rows = list(pool or [])
+    if not rows:
+        rows = [{'id': 'baseline-rule', 'kind': 'baseline', 'policy_mode': 'rule', 'path': None}]
+
+    selected = []
+    for _ in range(seat_count):
+        selected.append(rng.choice(rows))
+    return selected
+
+
+def _build_policy_factory(opponent_rows, candidate_seat=None):
+    seat_rows = {seat: row for seat, row in enumerate(opponent_rows)}
+
+    def policy_factory(state):
+        row = seat_rows.get(state.my_id)
+        if row is None:
+            return GoalBasedPolicy(state)
+        if candidate_seat is not None and state.my_id == int(candidate_seat):
+            return GoalBasedPolicy(state)
+        policy_mode = str(row.get('policy_mode', 'rule')).strip().lower()
+        if policy_mode == 'rule' or row.get('kind') == 'baseline':
+            return GoalBasedPolicy(state)
+        return create_policy(state, mode=policy_mode, model_path=row.get('path'))
+
+    return policy_factory
 
 class _Player:
 
@@ -398,16 +454,24 @@ class Game:
                 elif other != pid:
                     self.scores[other] -= 8
 
-def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.05, no_clear=False, export_dataset_path=None):
+def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.05, no_clear=False, export_dataset_path=None, opponent_registry_path=None, random_opponents=False):
     wins = defaultdict(int)
     total_fan = defaultdict(int)
     draws = 0
     writer = None
+    opponent_pool = _load_opponent_registry(opponent_registry_path)
     if export_dataset_path:
         writer = JsonlTrajectoryWriter(export_dataset_path)
     try:
         for i in range(n):
-            g = Game(quan=quan, seed=None if seed is None else seed + i, dataset_writer=writer, game_id=f'game-{i}')
+            game_seed = None if seed is None else seed + i
+            policy_factory = None
+            if opponent_pool and random_opponents:
+                rng = random.Random(game_seed if game_seed is not None else i)
+                opponent_rows = _sample_opponent_rows(opponent_pool, 4, rng)
+                policy_factory = _build_policy_factory(opponent_rows)
+
+            g = Game(quan=quan, seed=game_seed, dataset_writer=writer, game_id=f'game-{i}', policy_factory=policy_factory)
             result = g.run()
             if result['winner'] is None:
                 draws += 1
@@ -460,5 +524,7 @@ if __name__ == '__main__':
     parser.add_argument('--tui-delay', type=float, default=0.05, help='Seconds between TUI frames (default: 0.05)')
     parser.add_argument('--no-clear', action='store_true', help='Do not clear screen between TUI frames')
     parser.add_argument('--export-dataset', type=str, default=None, help='Optional path to write trajectory dataset JSONL.')
+    parser.add_argument('--opponent-registry', type=str, default=None, help='Path to opponents_registry.json to sample opponents from')
+    parser.add_argument('--random-opponents', action='store_true', help='Randomly sample all four seats from the opponent registry for each game')
     args = parser.parse_args()
-    run_games(n=args.games, quan=args.quan, seed=args.seed, show_turns=args.show_turns, tui=args.tui, tui_delay=args.tui_delay, no_clear=args.no_clear, export_dataset_path=args.export_dataset)
+    run_games(n=args.games, quan=args.quan, seed=args.seed, show_turns=args.show_turns, tui=args.tui, tui_delay=args.tui_delay, no_clear=args.no_clear, export_dataset_path=args.export_dataset, opponent_registry_path=args.opponent_registry, random_opponents=args.random_opponents)

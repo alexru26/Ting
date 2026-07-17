@@ -1,12 +1,15 @@
 import argparse
 import json
 import os
+import random
 
 from local_game import Game
 from policy import GoalBasedPolicy
 from model import CnnPolicyValueModel
 from features import FeatureExtractor
 from model_governance import build_model_registry_entry, duplicate_wall_evaluation, sprt_promotion_gate, write_model_registry
+from action_codec import ActionCodec
+import runtime_model
 
 
 def _safe_int(value, default_value):
@@ -21,6 +24,106 @@ def _safe_float(value, default_value):
         return float(value)
     except Exception:
         return default_value
+
+
+def _repo_root():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resolve_registry_model_path(path):
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(_repo_root(), path))
+
+
+class _LoadedOpponentPolicy:
+    def __init__(self, state, model, temperature=1.0, belief_weight=0.25, efficiency_weight=0.2):
+        self.state = state
+        self.model = model
+        self.temperature = float(temperature)
+        self.belief_weight = float(belief_weight)
+        self.efficiency_weight = float(efficiency_weight)
+        self.feature_extractor = FeatureExtractor()
+
+    def choose_action(self):
+        legal_actions = self.state.enumerate_legal_actions()
+        if not legal_actions:
+            return 'PASS'
+
+        features = self.feature_extractor.extract(self.state)
+        action = runtime_model.choose_action_from_model(
+            model=self.model,
+            features=features,
+            legal_actions=legal_actions,
+            codec=ActionCodec(),
+            belief_weight=self.belief_weight,
+            efficiency_weight=self.efficiency_weight,
+            temperature=self.temperature,
+        )
+        if action and self.state.is_legal_action(action):
+            return action
+        return GoalBasedPolicy(self.state).choose_action()
+
+
+def _load_registry_model(row, model_cache):
+    path = _resolve_registry_model_path(row.get('path'))
+    if not path:
+        return None
+    if path in model_cache:
+        return model_cache[path]
+
+    try:
+        model_cache[path] = runtime_model.load_policy_model(path)
+    except Exception:
+        model_cache[path] = None
+    return model_cache[path]
+
+
+def _sample_opponent_rows(pool, opponent_count, seed):
+    opponent_count = max(0, _safe_int(opponent_count, 0))
+    rows = [row for row in list(pool or []) if row.get('kind') != 'candidate']
+    if not rows:
+        rows = [{'id': 'baseline-rule', 'kind': 'baseline', 'policy_mode': 'rule', 'path': None}]
+
+    rng = random.Random(int(seed))
+    rng.shuffle(rows)
+
+    selected = []
+    while len(selected) < opponent_count:
+        for row in rows:
+            selected.append(row)
+            if len(selected) >= opponent_count:
+                break
+        if len(rows) > 1:
+            rng.shuffle(rows)
+    return selected[:opponent_count]
+
+
+def _build_episode_policy_factory(candidate_model, candidate_seat, opponent_rows, candidate_buffer, model_cache):
+    seat_rows = {int(seat): row for seat, row in opponent_rows.items()}
+
+    def policy_factory(state):
+        seat = int(state.my_id)
+        if seat == int(candidate_seat):
+            return PpoPolicy(state, candidate_model, buffer=candidate_buffer, explore=True, temperature=1.0)
+
+        row = seat_rows.get(seat)
+        if not row:
+            return GoalBasedPolicy(state)
+
+        policy_mode = str(row.get('policy_mode', 'rule')).strip().lower()
+        if policy_mode == 'rule' or row.get('kind') == 'baseline':
+            return GoalBasedPolicy(state)
+
+        model = _load_registry_model(row, model_cache)
+        if model is None:
+            return GoalBasedPolicy(state)
+
+        return _LoadedOpponentPolicy(state, model)
+
+    return policy_factory
 
 
 def _print_progress_bar(prefix, current, total, width=32):
@@ -262,9 +365,16 @@ def run_ppo_fine_tuning(
     placement_weight=0.0,
     game_factory=None,
     device='cpu',
+    opponent_registry_path=None,
 ):
     model = CnnPolicyValueModel.load(model_path, device=device)
     game_factory = game_factory or Game
+    registry_path = opponent_registry_path or _resolve_registry_model_path(os.path.join('data', 'opponents_registry.json'))
+    opponent_pool = build_opponent_league_pool(
+        candidate_path=model_path,
+        external_registry_path=registry_path,
+    )
+    model_cache = {}
 
     train_summary = {
         'model_path': model_path,
@@ -285,11 +395,16 @@ def run_ppo_fine_tuning(
 
     for episode_index in range(total_episodes):
         buffer = EpisodeBuffer()
-
-        def policy_factory(state):
-            if state.my_id == int(candidate_seat):
-                return PpoPolicy(state, model, buffer=buffer, explore=True, temperature=1.0)
-            return GoalBasedPolicy(state)
+        opponent_rows = _sample_opponent_rows(opponent_pool, 4 - 1, seed + episode_index)
+        opponent_seats = [seat for seat in range(4) if seat != int(candidate_seat)]
+        seat_opponents = {seat: row for seat, row in zip(opponent_seats, opponent_rows)}
+        policy_factory = _build_episode_policy_factory(
+            candidate_model=model,
+            candidate_seat=candidate_seat,
+            opponent_rows=seat_opponents,
+            candidate_buffer=buffer,
+            model_cache=model_cache,
+        )
 
         game = game_factory(quan=quan, seed=seed + episode_index, policy_factory=policy_factory)
         result = game.run()
@@ -467,6 +582,7 @@ def main():
     ppo_train_parser.add_argument('--fan-weight', type=float, default=0.0, help='Reward weight for fan bonus')
     ppo_train_parser.add_argument('--placement-weight', type=float, default=0.0, help='Reward weight for placement proxy')
     ppo_train_parser.add_argument('--device', default='cpu', help='Torch device: cpu, cuda, cuda:0, or auto')
+    ppo_train_parser.add_argument('--opponent-registry', default=None, help='Path to opponents_registry.json for external self-play opponents')
 
     ppo_eval_parser = sub.add_parser('ppo-eval', help='Evaluate a candidate checkpoint against baseline opponents')
     ppo_eval_parser.add_argument('--model', required=True, help='Model checkpoint path to evaluate')
@@ -507,6 +623,7 @@ def main():
             fan_weight=args.fan_weight,
             placement_weight=args.placement_weight,
             device=args.device,
+            opponent_registry_path=args.opponent_registry,
         )
         print(json.dumps(summary, indent=2, sort_keys=True))
         return

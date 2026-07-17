@@ -174,6 +174,13 @@ def _iter_records(dataset_path, max_records=None):
             break
 
 
+def _is_decision_record(record):
+    legal_actions = list(record.legal_actions or [])
+    if record.action not in legal_actions:
+        legal_actions.append(record.action)
+    return len(legal_actions) > 1
+
+
 def _collect_training_records(dataset_path, max_records=None, decision_only=False):
     records = []
     kept = 0
@@ -181,11 +188,7 @@ def _collect_training_records(dataset_path, max_records=None, decision_only=Fals
     limit = None if max_records is None else int(max_records)
 
     for record in JsonlTrajectoryReader(dataset_path):
-        legal_actions = list(record.legal_actions or [])
-        if record.action not in legal_actions:
-            legal_actions.append(record.action)
-
-        if decision_only and len(legal_actions) <= 1:
+        if decision_only and not _is_decision_record(record):
             dropped_forced += 1
             continue
 
@@ -222,10 +225,13 @@ def _split_records(records, train_ratio=0.8, seed=7):
     return train_records, validation_records
 
 
-def _evaluate_masked_cross_entropy(model, records):
+def _evaluate_masked_cross_entropy(model, records, decision_only=False):
     nll_sum = 0.0
     evaluated = 0
     for record in records:
+        if decision_only and not _is_decision_record(record):
+            continue
+
         legal_actions = list(record.legal_actions or [])
         if not legal_actions:
             continue
@@ -564,6 +570,8 @@ def train_cnn(
     epochs_without_improvement = 0
     stopped_early = False
     epochs_trained = 0
+    validation_decision_only = False
+    validation_decision_count = 0
 
     for epoch_idx in range(epoch_total):
         if verbose:
@@ -611,14 +619,40 @@ def train_cnn(
         if using_preencoded_cache:
             if validation_preencoded_indices is None or len(validation_preencoded_indices) <= 0:
                 continue
-            val_masked_cross_entropy, val_evaluated = model.evaluate_preencoded_loss_for_indices(
-                preencoded,
-                sample_indices=validation_preencoded_indices,
-            )
+            cache_payload = preencoded
+            assert cache_payload is not None
+            decision_mask = np.asarray(cache_payload['decision_mask'][validation_preencoded_indices], dtype=bool)
+            decision_indices = validation_preencoded_indices[decision_mask]
+            if len(decision_indices) > 0:
+                validation_decision_only = True
+                validation_decision_count = int(len(decision_indices))
+                val_masked_cross_entropy, val_evaluated = model.evaluate_preencoded_loss_for_indices(
+                    cache_payload,
+                    sample_indices=decision_indices,
+                )
+            else:
+                validation_decision_only = False
+                validation_decision_count = int(len(validation_preencoded_indices))
+                val_masked_cross_entropy, val_evaluated = model.evaluate_preencoded_loss_for_indices(
+                    cache_payload,
+                    sample_indices=validation_preencoded_indices,
+                )
         else:
             if not validation_records_list:
                 continue
-            val_masked_cross_entropy, val_evaluated = _evaluate_masked_cross_entropy(model, validation_records_list)
+            decision_records = [record for record in validation_records_list if _is_decision_record(record)]
+            if decision_records:
+                validation_decision_only = True
+                validation_decision_count = len(decision_records)
+                val_masked_cross_entropy, val_evaluated = _evaluate_masked_cross_entropy(
+                    model,
+                    decision_records,
+                    decision_only=True,
+                )
+            else:
+                validation_decision_only = False
+                validation_decision_count = len(validation_records_list)
+                val_masked_cross_entropy, val_evaluated = _evaluate_masked_cross_entropy(model, validation_records_list)
         if val_masked_cross_entropy is None:
             if verbose:
                 print('validation skipped for epoch %d/%d (no evaluable records)' % (epoch_idx + 1, epoch_total))
@@ -688,6 +722,8 @@ def train_cnn(
             'belief_weight': float(belief_weight),
             'forced_policy_weight': float(forced_policy_weight),
             'promotion_metric': 'top1_masked_accuracy',
+            'validation_decision_only': bool(validation_decision_only),
+            'validation_decision_count': int(validation_decision_count),
             'calibration_temperature': float(selected_temperature),
             'ablation': {
                 'encoder': bool(ablate_encoder),

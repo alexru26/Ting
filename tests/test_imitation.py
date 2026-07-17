@@ -9,15 +9,17 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 
 from action_codec import ActionCodec
-from dataset import JsonlTrajectoryWriter, TrajectoryRecord
+from dataset import JsonlTrajectoryReader, JsonlTrajectoryWriter, TrajectoryRecord
 from imitation import (
     _resolve_model_out_path,
+    _evaluate_masked_cross_entropy,
     choose_action_from_model,
     evaluate_cnn,
     load_policy_model,
     preencode_cnn,
     train_cnn,
 )
+from model import CnnPolicyValueModel
 from policy import NeuralPolicy
 from state import GameState
 
@@ -265,6 +267,26 @@ class TestImitationNeuralOnly(unittest.TestCase):
             self.assertEqual(metadata['value_weight'], 0.75)
             self.assertEqual(metadata['belief_weight'], 0.15)
             self.assertEqual(metadata['forced_policy_weight'], 0.0)
+
+    def test_evaluate_masked_cross_entropy_can_ignore_forced_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = os.path.join(tmp, 'train.jsonl')
+            self._write_dataset_with_forced(dataset_path)
+            records = list(JsonlTrajectoryReader(dataset_path))
+            codec = ActionCodec()
+            model = CnnPolicyValueModel(
+                action_space_size=codec.size,
+                hidden_size=16,
+                learning_rate=0.05,
+            )
+
+            full_loss, full_count = _evaluate_masked_cross_entropy(model, records)
+            decision_loss, decision_count = _evaluate_masked_cross_entropy(model, records, decision_only=True)
+
+            self.assertEqual(full_count, 2)
+            self.assertEqual(decision_count, 1)
+            self.assertIsNotNone(full_loss)
+            self.assertIsNotNone(decision_loss)
 
     def test_train_cnn_records_ablation_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
