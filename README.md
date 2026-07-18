@@ -29,7 +29,7 @@ python src/imitation.py train-cnn --dataset data/DATA.jsonl --cache data/DATA.pr
 ### 3. Reinforcement learning and self-play
 
 ```bash
-python src/rl_self_play.py ppo-train --model src/MODEL.h5 --games 100 --eval-games 10 --device auto --opponent-registry data/OPPONENTS.json
+python src/rl_self_play.py ppo-train --model src/MODEL.h5 --games 100 --eval-games 10 --device cpu --opponent-registry data/OPPONENTS.json
 ```
 
 ## Local Testing
