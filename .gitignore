@@ -3,7 +3,6 @@
 __pycache__
 .github/agents
 .github/copilot-instructions.md
-data
 botzone
 ai
 runpod
