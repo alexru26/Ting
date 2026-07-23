@@ -1,4 +1,3 @@
-numpy
-h5py
-torch
-pymahjonggb
+version https://git-lfs.github.com/spec/v1
+oid sha256:fb819de27babc911dbec7f54c4e5d511045f88698d6694d27a5118590a8e26e8
+size 33
