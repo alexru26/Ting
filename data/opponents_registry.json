@@ -1,0 +1,168 @@
+{
+  "count": 27,
+  "models_dir": "data\\models",
+  "opponents": [
+    {
+      "file_name": "imit_5bf7ad9934.pkl",
+      "id": "imit_5bf7ad9934",
+      "path": "data\\models\\imit_5bf7ad9934.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_5fdecf2bd9.pkl",
+      "id": "imit_5fdecf2bd9",
+      "path": "data\\models\\imit_5fdecf2bd9.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_62ff6f7c5f.pkl",
+      "id": "imit_62ff6f7c5f",
+      "path": "data\\models\\imit_62ff6f7c5f.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_68218edfd8.pkl",
+      "id": "imit_68218edfd8",
+      "path": "data\\models\\imit_68218edfd8.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_691abf2f36.pkl",
+      "id": "imit_691abf2f36",
+      "path": "data\\models\\imit_691abf2f36.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_6937e6b341.pkl",
+      "id": "imit_6937e6b341",
+      "path": "data\\models\\imit_6937e6b341.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_6969e9e4ec.pkl",
+      "id": "imit_6969e9e4ec",
+      "path": "data\\models\\imit_6969e9e4ec.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_69bbddfca8.pkl",
+      "id": "imit_69bbddfca8",
+      "path": "data\\models\\imit_69bbddfca8.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_6a084401fa.pkl",
+      "id": "imit_6a084401fa",
+      "path": "data\\models\\imit_6a084401fa.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_6a11a215b3.pkl",
+      "id": "imit_6a11a215b3",
+      "path": "data\\models\\imit_6a11a215b3.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_6a2d49fbb3.pkl",
+      "id": "imit_6a2d49fbb3",
+      "path": "data\\models\\imit_6a2d49fbb3.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_6a2d6020b3.pkl",
+      "id": "imit_6a2d6020b3",
+      "path": "data\\models\\imit_6a2d6020b3.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_Amy_xue.pkl",
+      "id": "imit_Amy_xue",
+      "path": "data\\models\\imit_Amy_xue.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_Chinese_zjc_.pkl",
+      "id": "imit_Chinese_zjc_",
+      "path": "data\\models\\imit_Chinese_zjc_.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_Legendx.pkl",
+      "id": "imit_Legendx",
+      "path": "data\\models\\imit_Legendx.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_Lilangi.pkl",
+      "id": "imit_Lilangi",
+      "path": "data\\models\\imit_Lilangi.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_QiuQiuR.pkl",
+      "id": "imit_QiuQiuR",
+      "path": "data\\models\\imit_QiuQiuR.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_Rouxqdd.pkl",
+      "id": "imit_Rouxqdd",
+      "path": "data\\models\\imit_Rouxqdd.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_cspsept.pkl",
+      "id": "imit_cspsept",
+      "path": "data\\models\\imit_cspsept.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_flbb.pkl",
+      "id": "imit_flbb",
+      "path": "data\\models\\imit_flbb.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_kong.pkl",
+      "id": "imit_kong",
+      "path": "data\\models\\imit_kong.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_player152.pkl",
+      "id": "imit_player152",
+      "path": "data\\models\\imit_player152.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_pyccc.pkl",
+      "id": "imit_pyccc",
+      "path": "data\\models\\imit_pyccc.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_whatcanisayman.pkl",
+      "id": "imit_whatcanisayman",
+      "path": "data\\models\\imit_whatcanisayman.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_\u6211\u4ec0\u4e48\u90fd\u4e0d\u4f1a.pkl",
+      "id": "imit_\u6211\u4ec0\u4e48\u90fd\u4e0d\u4f1a",
+      "path": "data\\models\\imit_\u6211\u4ec0\u4e48\u90fd\u4e0d\u4f1a.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_\u72d7\u5b50\u9171pia.pkl",
+      "id": "imit_\u72d7\u5b50\u9171pia",
+      "path": "data\\models\\imit_\u72d7\u5b50\u9171pia.pkl",
+      "policy_mode": "imitation"
+    },
+    {
+      "file_name": "imit_\u84dd\u6708_\u6b6a\u6b6a.pkl",
+      "id": "imit_\u84dd\u6708_\u6b6a\u6b6a",
+      "path": "data\\models\\imit_\u84dd\u6708_\u6b6a\u6b6a.pkl",
+      "policy_mode": "imitation"
+    }
+  ]
+}
