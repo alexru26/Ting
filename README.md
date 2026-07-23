@@ -1,90 +1,122 @@
 # Ting Mahjong Agent
 
-## Model Architecture
-
-The live policy is a hybrid stack: [src/state.py](src/state.py) reconstructs the full game state from request/response history, [src/features.py](src/features.py) converts that state into a deterministic feature dict, [src/model.py](src/model.py) turns the features into action scores and value estimates, and [src/runtime_model.py](src/runtime_model.py) wraps checkpoint loading plus inference. [src/policy.py](src/policy.py) chooses between the neural model, a rule-based fallback, and optional search.
-
-Model inputs are split into a tile tensor and a meta vector:
-
-- Tile tensor: 11 channels over the 34 tile types.
-- Channel 1: normalized hand counts.
-- Channel 2: normalized seen-tile counts.
-- Channel 3: normalized self-discard counts.
-- Channel 4: normalized pack counts.
-- Channels 5-7: normalized discard counts for up to three opponents.
-- Channel 8: raw hand counts.
-- Channel 9: raw seen-tile counts.
-- Channel 10: hand shanten, broadcast across all tile slots.
-- Channel 11: acceptancy, broadcast across all tile slots.
-
-The meta vector is 70 values and carries the rest of the context:
-
-- 8 legacy state scalars from the reconstructed game state.
-- Request context: request type, seat, target-player flag.
-- One-hot encodings for the event action and raw request action.
-- State quality signals: schema version, shanten, acceptancy, efficiency deltas, immediate hu availability, fan estimates, and tenpai profile.
-- Action-conditioned fan deltas for PASS, HU, GANG, PLAY, BUGANG, PENG, and CHI.
-- Opponent temporal summaries for up to three opponents: history length, pack count, honor ratios, and suit ratios.
-
-The network produces these outputs:
-
-- Family logits over PASS, HU, GANG, PLAY, BUGANG, PENG, and CHI.
-- Two conditioned argument heads for tile selection and discard selection.
-- Belief logits and belief probabilities over the remaining-tile distribution.
-- A main value head, an auxiliary value head, and an efficiency-bonus head.
-
-At runtime, [src/runtime_model.py](src/runtime_model.py) converts those outputs into either a chosen action string or a probability distribution over legal actions, and [src/bot.py](src/bot.py) validates the final action before returning it.
+A neural Chinese Standard Mahjong bot for [Botzone](https://botzone.org.cn). The
+runtime files under [src/](src/) are bundled into a zip for Botzone; the neural
+model is the only runtime decision source (there is no rule-based fallback).
 
 ## Runtime Decision Flow
 
-1. [src/bot.py](src/bot.py) reads the input payload, rebuilds [src/state.py](src/state.py) `GameState` from the full history, and rejects malformed turns with a safe `PASS`.
-2. [src/policy.py](src/policy.py) selects the active policy. The default is the neural policy, but rule-based fallback remains available and the model path can be overridden with environment variables.
-3. The policy calls [src/features.py](src/features.py) to extract the tile channels and meta features for the current seat.
-4. [src/runtime_model.py](src/runtime_model.py) loads [src/model.py](src/model.py), scores the legal actions, and applies the configured temperature, belief weight, and efficiency weight.
-5. If search is enabled, [src/search_planner.py](src/search_planner.py) can replace the raw model choice with a bounded rollout action.
-6. [src/bot.py](src/bot.py) validates legality one last time and falls back to `PASS` or a simple discard if the model output is unusable.
+1. [src/bot.py](src/bot.py) reads the Botzone JSON payload and rebuilds
+   [src/state.py](src/state.py) `GameState` from the full request/response history.
+2. `GameState.enumerate_legal_actions()` enumerates exactly the moves the judge
+   will accept: HU only when the hand actually wins (>= 8 fan), meld discards
+   that account for tiles consumed by the meld, claims only on other players'
+   discards, BUGANG only with the fourth tile in hand, and no PASS on draw
+   turns. Legality is guaranteed by construction, so the bot can never emit an
+   INVALID move.
+3. Turns with a single legal action are answered directly without model
+   inference. For real decisions, [src/features.py](src/features.py) converts the
+   state into the schema v4 features and [src/model.py](src/model.py) scores the
+   legal actions; [src/policy.py](src/policy.py) picks the argmax deterministically.
+4. Failures are explicit: a missing or incompatible checkpoint, malformed
+   input, or an illegal model output raises instead of silently degrading.
 
-In short, the runtime path is state reconstruction -> feature extraction -> model scoring -> legality check -> action string.
+In short: state reconstruction -> legal action enumeration -> feature
+extraction -> masked model scoring -> action string.
 
-## Training And Evaluation
+## Model Input Contract (feature schema v4)
+
+Inputs are split into tile planes and a meta vector, defined in
+[src/features.py](src/features.py) and enforced at checkpoint load time:
+
+- Tile planes (18 x 34, all values on a lossless 0.25 grid):
+  - 4 hand-count threshold planes (>=1, >=2, >=3, >=4 copies).
+  - 1 own-meld plane and 3 opponent-meld planes (relative seat order),
+    with melds expanded to per-tile counts (PENG=3, GANG=4, CHI=1 each).
+  - 1 own-discard plane and 3 opponent-discard planes (relative seat order).
+  - 4 unseen-count threshold planes (remaining copies from our perspective).
+  - 1 one-hot plane for the current event tile (drawn or claimed).
+  - 1 plane marking tiles that reduce shanten (acceptance set).
+- Meta vector (31 values): seat and prevalent-wind one-hots, decision phase
+  (draw / discard-response / bugang-response), relative last actor, last
+  request action, plus normalized scalars for flowers, meld count, game
+  progress, shanten, tenpai flag, acceptance count, and the can-win / win-fan
+  signal.
+
+The expensive fan-conditioned lookahead features from schema v3 (per-action
+wait-fan profiles) were removed: they cost hundreds of fan-calculator calls
+per decision and duplicated what the value head should learn.
+
+## Model Architecture
+
+[src/model.py](src/model.py) defines a residual policy-value network:
+
+- The 18x34 planes are reshaped onto a 4x9 grid (suit rows + honor row) and
+  processed by a Conv2d stem plus residual blocks, then fused with the meta
+  vector into a shared hidden state.
+- Heads: action-family logits (PASS/HU/GANG/PLAY/BUGANG/PENG/CHI),
+  family-conditioned argument logits (2 x 35), and a scalar value head.
+- An action is scored as `family + arg1 + arg2` logits, and the policy is a
+  softmax over the legal actions only. Training uses this same masked scoring,
+  so the training objective matches the runtime decision rule exactly.
+- One shared trunk with per-family conditioned heads gives per-action-family
+  specialisation while keeping a single checkpoint, which the Botzone bundle
+  requires.
+
+Checkpoints are HDF5 files with the architecture and feature contract stored
+as attributes; loading verifies both strictly and raises on any mismatch.
+
+## Training
 
 ### 1. Data generation
 
-Training data is generated locally by [src/local_game.py](src/local_game.py), which simulates full 4-player rounds and can export trajectory records through [src/dataset.py](src/dataset.py). Each JSONL record stores the game id, turn index, player id, request type, request action, chosen action, legal actions, reward, extracted features, and metadata.
-
-To locally generate dataset of opponent models:
+Training data is generated locally by [src/local_game.py](src/local_game.py), which
+simulates full 4-player rounds with the rule-based teacher in
+[src/rule_policy.py](src/rule_policy.py) and exports JSONL trajectories through
+[src/dataset.py](src/dataset.py). Rewards are backfilled after each game as the
+final score delta (scaled by 1/64) so the value head has a real target:
 
 ```bash
-python src/local_game.py --games 100 --opponent-registry data/OPPONENTS.json --random-opponents --export-dataset data/DATA.jsonl
+python src/local_game.py --games 1000 --seed 1 --export-dataset data/DATA.jsonl
 ```
 
-### 2. Supervised pretraining
+### 2. Supervised training
 
-The supervised pipeline has three stages:
-
-- Pre-encode the JSONL dataset with `preencode-cnn` to cache tensors in `.npz` form for faster training.
-- Train the CNN with `train-cnn`, which learns from the action family plus argument targets, the value targets, and the belief target derived from seen tiles.
-- Evaluate the checkpoint with `eval-cnn`, which reports masked cross-entropy and top-k metrics on the same trajectory format.
-
-To pre-encode the dataset for faster training:
+[src/imitation.py](src/imitation.py) trains from a compact pre-encoded cache that
+is built automatically (one streaming pass, quantized uint8 planes) when
+missing or stale:
 
 ```bash
-python src/imitation.py preencode-cnn --dataset data/DATA.jsonl --output data/DATA.preencoded.npz --device cpu
+python src/imitation.py train-cnn --dataset data/DATA.jsonl --out src/model.h5 \
+    --epochs 20 --channels 64 --blocks 6 --hidden-size 512 --batch-size 1024 \
+    --device auto --verbose
 ```
 
-To train on the pre-encoded dataset:
+Training minimizes masked legal-action cross-entropy plus a value loss, with
+early stopping on validation masked cross-entropy. Forced turns contribute
+zero policy loss automatically (their legal softmax is a point mass), so no
+decision-only filtering is needed. Evaluate with:
 
 ```bash
-python src/imitation.py train-cnn --dataset data/DATA.jsonl --cache data/DATA.preencoded.npz --out src/MODEL.h5 --epochs 10 --hidden-size 64 --batch-size 2048 --device auto --verbose
+python src/imitation.py eval-cnn --dataset data/DATA.jsonl --model src/model.h5
 ```
 
 ### 3. Reinforcement learning and self-play
 
-Reinforcement learning and self-play live in [src/rl_self_play.py](src/rl_self_play.py): `ppo-train` fine-tunes a checkpoint against rule-based and registry-backed opponents, while `ppo-eval` measures the candidate against baseline opponents. The reward signal combines score delta, winner fan bonus, and a placement proxy.
+[src/rl_self_play.py](src/rl_self_play.py) fine-tunes a checkpoint with batched
+PPO updates collected over whole games against the rule-based baseline and
+optional historical checkpoints:
 
 ```bash
-python src/rl_self_play.py ppo-train --model src/MODEL.h5 --games 100 --eval-games 10 --device cpu --opponent-registry data/OPPONENTS.json
+python src/rl_self_play.py ppo-train --model src/model.h5 --games 512 \
+    --eval-games 64 --update-every 8 --device auto \
+    --opponents checkpoints/old_a.h5 checkpoints/old_b.h5
 ```
+
+`ppo-eval` measures a candidate greedily against rule-based baselines, and
+`duplicate-wall` plays candidate and baseline over identical walls for
+low-variance comparisons gated by SPRT
+([src/model_governance.py](src/model_governance.py)).
 
 ## Local Testing
 
@@ -94,8 +126,25 @@ Run a single game and print the final state:
 python src/local_game.py --games 1 --seed 42
 ```
 
+Pipe a Botzone-style payload through the bot:
+
+```bash
+echo '{"requests": ["0 0 0", "1 0 0 0 0 W1 W2 W3 B4 B5 B6 T7 T8 T9 J1 J1 F1 F2", "2 W4"], "responses": ["PASS", "PASS"]}' | python src/bot.py
+```
+
 Run the full test suite:
 
 ```bash
 python -m unittest -q
 ```
+
+## Botzone Bundle
+
+Zip the runtime files (entry point `__main__.py`) plus the checkpoint:
+
+```
+src/__main__.py src/bot.py src/policy.py src/state.py src/features.py
+src/model.py src/scoring.py src/tiles.py src/dataset.py src/model.h5
+```
+
+(`dataset.py` is not needed at runtime and may be omitted; everything else is.)

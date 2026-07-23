@@ -1,6 +1,9 @@
 from collections import Counter
 
 from tiles import ALL_TILES, NUMBERED_SUITS, normalize_tiles, tile_value
+from scoring import calculate_fan
+
+MIN_WIN_FAN = 8
 
 
 class GameState:
@@ -23,6 +26,7 @@ class GameState:
 
         self._last_discard = None
         self._last_discard_player = None
+        self._last_drawer = None
         self._pending_gang_tile = None
         self._pending_bugang_tile = None
 
@@ -137,7 +141,10 @@ class GameState:
             return
         action = parts[2]
 
-        if action == 'DRAW' or action == 'BUHUA':
+        if action == 'DRAW':
+            self._last_drawer = actor
+            return
+        if action == 'BUHUA':
             return
 
         if action == 'PLAY':
@@ -196,7 +203,13 @@ class GameState:
             seq = ['%s%d' % (suit, mid_val - 1), mid, '%s%d' % (suit, mid_val + 1)]
             if any((not self._is_valid_tile(t) for t in seq)):
                 return
+            # The claimed discard was already counted when it was played; only
+            # the two tiles contributed from the actor's hand become newly seen.
+            claimed_seen = claimed if claimed in seq else None
             for t in seq:
+                if t == claimed_seen:
+                    claimed_seen = None
+                    continue
                 self.seen_tiles[t] += 1
             if actor == self.my_id and claimed:
                 offer = seq.index(claimed) if claimed in seq else 0
@@ -233,11 +246,17 @@ class GameState:
                             self.hand.remove(gtile)
                     self.packs.append(('GANG', gtile, self._last_discard_player))
                     self.seen_tiles[gtile] += 3
+            elif self._last_drawer == actor:
+                # Concealed kong right after the actor's own draw: the four
+                # tiles stay hidden, so no seen-tile update is possible.
+                self.opponent_packs.setdefault(actor, []).append(('GANG', None, actor))
             else:
                 gtile = self._last_discard
                 if gtile:
                     self.opponent_packs.setdefault(actor, []).append(('GANG', gtile, self._last_discard_player))
-                    self.seen_tiles[gtile] += 4
+                    # The claimed discard is already in seen_tiles; the three
+                    # tiles from the actor's hand are newly revealed.
+                    self.seen_tiles[gtile] += 3
             return
 
         if action == 'BUGANG':
@@ -342,55 +361,128 @@ class GameState:
     def add_pack(self, pack_type, tile, offer):
         self.packs.append((pack_type, tile, offer))
 
+    def current_win_fan(self):
+        """Fan value if HU is declared on the current event, else 0.
+
+        Covers self-drawn wins (type 2), wins on another player's discard
+        (type 3 PLAY), and robbing a supplement kong (type 3 BUGANG).
+        """
+        request_type = self.last_request_type
+        request_action = self.last_request_action
+        tile = self.last_tile
+        if not tile or tile not in ALL_TILES:
+            return 0
+
+        is_self_drawn = False
+        is_about_kong = False
+        hand = list(self.hand)
+        if request_type == 2:
+            is_self_drawn = True
+            if tile in hand:
+                hand.remove(tile)
+        elif request_type == 3 and self.last_actor != self.my_id and request_action == 'PLAY':
+            pass
+        elif request_type == 3 and self.last_actor != self.my_id and request_action == 'BUGANG':
+            is_about_kong = True
+        else:
+            return 0
+
+        if len(hand) != max(1, 13 - 3 * len(self.packs)):
+            return 0
+
+        try:
+            return int(
+                calculate_fan(
+                    self.fan_calc_packs(),
+                    tuple(hand),
+                    tile,
+                    int(self.flowers),
+                    is_self_drawn,
+                    False,
+                    is_about_kong,
+                    False,
+                    self.my_id % 4,
+                    self.quan,
+                )
+            )
+        except Exception:
+            # MahjongGB raises when the shape is not a winning hand.
+            return 0
+
+    def can_hu(self):
+        return self.current_win_fan() >= MIN_WIN_FAN
+
     def enumerate_legal_actions(self):
+        """All actions Botzone will accept for the current request.
+
+        Every action returned here must be valid on the judge side; the
+        policy chooses only from this list, so soundness here is what
+        guarantees the bot never emits an INVALID move.
+        """
         actions = []
         request_type = self.last_request_type
         request_action = self.last_request_action
 
         if request_type == 2:
-            actions.extend(['PASS', 'HU'])
-            for tile in normalize_tiles(list(set(self.hand))):
+            # After a draw the bot must act: PASS is not a legal response.
+            if self.can_hu():
+                actions.append('HU')
+            unique_hand = normalize_tiles(list(set(self.hand)))
+            for tile in unique_hand:
                 actions.append('PLAY %s' % tile)
-
-            for tile in normalize_tiles(list(set(self.hand))):
+            for tile in unique_hand:
                 if self.hand.count(tile) >= 4:
                     actions.append('GANG %s' % tile)
-
-            bugang_tiles = {tile for ptype, tile, _ in self.packs if ptype == 'PENG'}
-            for tile in normalize_tiles(list(bugang_tiles)):
-                actions.append('BUGANG %s' % tile)
+            peng_tiles = {tile for ptype, tile, _ in self.packs if ptype == 'PENG'}
+            for tile in unique_hand:
+                if tile in peng_tiles:
+                    actions.append('BUGANG %s' % tile)
 
         elif request_type == 3:
-            if request_action == 'PLAY':
-                actions.extend(['PASS', 'HU'])
+            if request_action == 'PLAY' and self.last_actor != self.my_id:
+                actions.append('PASS')
+                if self.can_hu():
+                    actions.append('HU')
                 last_tile = self.last_tile or ''
                 if self.hand.count(last_tile) >= 3:
                     actions.append('GANG')
-
                 if self.hand.count(last_tile) >= 2:
-                    for discard in normalize_tiles(list(set(self.hand))):
+                    for discard in self._discards_after_removal([last_tile, last_tile]):
                         actions.append('PENG %s' % discard)
-
                 if self._chi_allowed():
                     for mid_tile in self._valid_chi_mids(last_tile):
-                        for discard in normalize_tiles(list(set(self.hand))):
+                        used = self._chi_used_tiles(mid_tile, last_tile)
+                        for discard in self._discards_after_removal(used):
                             actions.append('CHI %s %s' % (mid_tile, discard))
-            elif request_action == 'BUGANG':
-                actions.extend(['PASS', 'HU'])
-            elif request_action in ('GANG', 'PENG', 'CHI', 'DRAW', 'BUHUA'):
+            elif request_action == 'BUGANG' and self.last_actor != self.my_id:
+                actions.append('PASS')
+                if self.can_hu():
+                    actions.append('HU')
+            else:
                 actions.append('PASS')
         else:
             actions.append('PASS')
 
         return self._dedupe_actions(actions)
 
+    def _discards_after_removal(self, used_tiles):
+        """Distinct tiles still discardable after `used_tiles` leave the hand."""
+        remaining = Counter(self.hand)
+        for tile in used_tiles:
+            remaining[tile] -= 1
+        if any(count < 0 for count in remaining.values()):
+            return []
+        return normalize_tiles([tile for tile, count in remaining.items() if count > 0])
+
+    @staticmethod
+    def _chi_used_tiles(mid_tile, claimed_tile):
+        suit = mid_tile[0]
+        mid_val = int(mid_tile[1:])
+        seq = ['%s%d' % (suit, mid_val - 1), mid_tile, '%s%d' % (suit, mid_val + 1)]
+        return [tile for tile in seq if tile != claimed_tile]
+
     def is_legal_action(self, action):
         return action in set(self.enumerate_legal_actions())
-
-    def legal_action_mask(self, codec):
-        legal = set(self.enumerate_legal_actions())
-        action_list = codec.all_actions()
-        return [1 if action in legal else 0 for action in action_list]
 
     def _chi_allowed(self):
         if not self.last_tile or self.last_tile[0] not in NUMBERED_SUITS:

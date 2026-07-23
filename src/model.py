@@ -1,17 +1,27 @@
+"""Policy-value network for the Ting Mahjong agent.
+
+Architecture (v2):
+
+- Input A: `PLANE_COUNT x 34` tile planes, reshaped onto a 4x9 grid
+  (rows: W, B, T, honors with 2 padded cells) so 2D convolutions see both
+  rank adjacency (chi shapes) and same-rank-across-suit structure.
+- Input B: `META_COUNT` scalar context vector.
+- Trunk: conv stem + residual blocks, flattened and fused with the meta
+  embedding into a shared hidden state.
+- Heads: action-family logits (7), family-conditioned argument logits
+  (2 x 35, tile vocabulary + NONE), and a scalar value head.
+
+An action `FAMILY [arg1] [arg2]` is scored as
+`family_logit + arg1_logit + arg2_logit`, and the policy is a softmax over
+the *legal* actions only. Training uses exactly the same masked scoring, so
+the learning target matches the runtime decision rule (TODO 8: this is the
+"multiple models per action" idea realised as one shared trunk with
+per-family conditioned heads - a single checkpoint, which the Botzone
+bundle requires, with per-family specialisation).
+"""
+
 import json
-import math
 import os
-from typing import Any, cast
-
-class _NoOpContext(object):
-    def __init__(self, enter_result=None):
-        self.enter_result = enter_result
-
-    def __enter__(self):
-        return self.enter_result
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
 
 import h5py
 import numpy as np
@@ -19,64 +29,47 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from action_codec import ActionCodec
-from ml_packages import package_profile
+from features import FEATURE_SCHEMA_VERSION, META_COUNT, PLANE_COUNT
 from tiles import ALL_TILES
-
 
 FAMILY_LABELS = ['PASS', 'HU', 'GANG', 'PLAY', 'BUGANG', 'PENG', 'CHI']
 NONE_TOKEN = '<NONE>'
-
-EVENT_VOCAB = [
-    None,
-    'INIT',
-    'DEAL',
-    'DRAW',
-    'PLAY',
-    'PENG',
-    'CHI',
-    'GANG',
-    'BUGANG',
-    'HU',
-    'PASS',
-]
-
-REQUEST_VOCAB = [
-    None,
-    'DRAW',
-    'PLAY',
-    'GANG',
-    'BUGANG',
-    'HU',
-    'PASS',
-]
-
-ACTION_FAMILY_ORDER = ['PASS', 'HU', 'GANG', 'PLAY', 'BUGANG', 'PENG', 'CHI']
-
+ARG_VOCAB = list(ALL_TILES) + [NONE_TOKEN]
 
 TILE_COUNT = len(ALL_TILES)
-CHANNEL_COUNT = 11
-TEMPORAL_FEATURES_PER_OPPONENT = 7
-TEMPORAL_OPPONENT_COUNT = 3
-ACTION_CONDITIONED_META_COUNT = len(ACTION_FAMILY_ORDER)
-FAN_TENPAI_META_COUNT = 8
-EXTRA_META_COUNT = 1 + 1 + 3 + FAN_TENPAI_META_COUNT + ACTION_CONDITIONED_META_COUNT + (TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT)
-META_COUNT = 8 + 3 + len(EVENT_VOCAB) + len(REQUEST_VOCAB) + EXTRA_META_COUNT
-INPUT_SIZE = TILE_COUNT * CHANNEL_COUNT + META_COUNT
+GRID_ROWS = 4
+GRID_COLS = 9
+GRID_CELLS = GRID_ROWS * GRID_COLS
+
+MODEL_TYPE = 'ting_cnn_v2'
+
+_FAMILY_INDEX = {label: idx for idx, label in enumerate(FAMILY_LABELS)}
+_ARG_INDEX = {label: idx for idx, label in enumerate(ARG_VOCAB)}
+_NONE_INDEX = _ARG_INDEX[NONE_TOKEN]
 
 
-def _safe_int(value, default_value):
-    try:
-        return int(value)
-    except Exception:
-        return default_value
+def resolve_device(requested_device='cpu'):
+    requested = str(requested_device or 'cpu').strip().lower() or 'cpu'
+    if requested == 'auto':
+        if torch.cuda.is_available():
+            return torch.device('cuda'), requested, 'cuda'
+        return torch.device('cpu'), requested, 'cpu'
+    if requested.startswith('cuda'):
+        if torch.cuda.is_available():
+            return torch.device(requested), requested, requested
+        return torch.device('cpu'), requested, 'cpu'
+    return torch.device('cpu'), requested, 'cpu'
 
 
-def _safe_float(value, default_value):
-    try:
-        return float(value)
-    except Exception:
-        return default_value
+def encode_action(action):
+    """Map an action string to (family_index, arg1_index, arg2_index)."""
+    parts = str(action).split()
+    if not parts or parts[0] not in _FAMILY_INDEX:
+        raise ValueError('Unknown action family: %r' % (action,))
+    family = _FAMILY_INDEX[parts[0]]
+    arg1 = _ARG_INDEX.get(parts[1], _NONE_INDEX) if len(parts) > 1 else _NONE_INDEX
+    arg2 = _ARG_INDEX.get(parts[2], _NONE_INDEX) if len(parts) > 2 else _NONE_INDEX
+    return family, arg1, arg2
 
 
 def _print_progress_bar(prefix, current, total, width=32):
@@ -90,1328 +83,575 @@ def _print_progress_bar(prefix, current, total, width=32):
         print('')
 
 
-def resolve_device(requested_device='cpu'):
-    requested = str(requested_device or 'cpu').strip().lower()
-    if not requested:
-        requested = 'cpu'
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
 
-    if requested == 'auto':
-        if torch.cuda.is_available():
-            return torch.device('cuda'), requested, 'cuda'
-        return torch.device('cpu'), requested, 'cpu'
-
-    if requested.startswith('cuda'):
-        if torch.cuda.is_available():
-            try:
-                return torch.device(requested), requested, requested
-            except Exception:
-                return torch.device('cuda'), requested, 'cuda'
-        return torch.device('cpu'), requested, 'cpu'
-
-    return torch.device('cpu'), requested, 'cpu'
+    def forward(self, x):
+        out = F.relu(self.conv1(x))
+        out = self.conv2(out)
+        return F.relu(x + out)
 
 
 class CnnCore(nn.Module):
-    def __init__(self, hidden_size, family_size, arg_size):
+    def __init__(self, channels, blocks, hidden_size, family_embedding_size=32):
         super().__init__()
-        self.conv1 = nn.Conv1d(CHANNEL_COUNT, 24, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(24, 24, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv1d(24, 24, kernel_size=3, padding=1)
-        self.meta_proj = nn.Linear(META_COUNT, 48)
-        self.hidden_fuse = nn.Linear(24 + 48, hidden_size)
+        self.stem = nn.Conv2d(PLANE_COUNT, channels, kernel_size=3, padding=1)
+        self.blocks = nn.ModuleList([ResidualBlock(channels) for _ in range(blocks)])
+        self.meta_proj = nn.Linear(META_COUNT, 64)
+        self.trunk = nn.Linear(channels * GRID_CELLS + 64, hidden_size)
 
-        self.temporal_proj = nn.Linear(TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT, 24)
-        self.post_temporal = nn.Linear(hidden_size + 24, hidden_size)
+        self.family_head = nn.Linear(hidden_size, len(FAMILY_LABELS))
+        self.family_embedding = nn.Embedding(len(FAMILY_LABELS), family_embedding_size)
+        self.arg1_head = nn.Linear(hidden_size + family_embedding_size, len(ARG_VOCAB))
+        self.arg2_head = nn.Linear(hidden_size + family_embedding_size, len(ARG_VOCAB))
 
-        self.belief_head = nn.Linear(hidden_size, TILE_COUNT)
-        self.belief_proj = nn.Linear(TILE_COUNT, 16)
-        self.output_fuse = nn.Linear(hidden_size + 16, hidden_size)
+        self.value_hidden = nn.Linear(hidden_size, hidden_size // 2)
+        self.value_head = nn.Linear(hidden_size // 2, 1)
 
-        self.family_head = nn.Linear(hidden_size, family_size)
-        self.family_embedding = nn.Embedding(family_size, hidden_size)
+    def forward(self, tile_planes, meta):
+        batch_size = tile_planes.shape[0]
+        x = F.pad(tile_planes, (0, GRID_CELLS - TILE_COUNT))
+        x = x.view(batch_size, PLANE_COUNT, GRID_ROWS, GRID_COLS)
+        x = F.relu(self.stem(x))
+        for block in self.blocks:
+            x = block(x)
+        x = x.reshape(batch_size, -1)
 
-        self.arg1_head = nn.Linear(hidden_size * 2, arg_size)
-        self.arg2_head = nn.Linear(hidden_size * 2, arg_size)
+        meta_features = F.relu(self.meta_proj(meta))
+        hidden = F.relu(self.trunk(torch.cat([x, meta_features], dim=-1)))
 
-        self.value_hidden = nn.Linear(hidden_size, hidden_size)
-        self.value_head = nn.Linear(hidden_size, 1)
-        self.aux_value_head = nn.Linear(hidden_size, 1)
-        self.efficiency_bonus_head = nn.Linear(hidden_size, 1)
-
-    def forward(self, tile_tensor, meta_tensor):
-        tile_features = F.relu(self.conv1(tile_tensor))
-        tile_features = F.relu(self.conv2(tile_features))
-        tile_features = F.relu(self.conv3(tile_features))
-        tile_features = F.adaptive_avg_pool1d(tile_features, 1).squeeze(-1)
-
-        meta_features = F.relu(self.meta_proj(meta_tensor))
-        hidden = F.relu(self.hidden_fuse(torch.cat([tile_features, meta_features], dim=-1)))
-
-        temporal_width = TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT
-        temporal_slice = meta_tensor[:, -temporal_width:]
-        temporal_features = F.relu(self.temporal_proj(temporal_slice))
-        hidden = F.relu(self.post_temporal(torch.cat([hidden, temporal_features], dim=-1)))
-
-        belief_logits = self.belief_head(hidden)
-        belief_probs = torch.softmax(belief_logits, dim=-1)
-        belief_context = F.relu(self.belief_proj(belief_probs))
-        hidden = F.relu(self.output_fuse(torch.cat([hidden, belief_context], dim=-1)))
-
-        value_hidden = F.relu(self.value_hidden(hidden))
+        family_count = len(FAMILY_LABELS)
+        embeddings = self.family_embedding.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        conditioned = torch.cat(
+            [hidden.unsqueeze(1).expand(-1, family_count, -1), embeddings], dim=-1
+        )
 
         return {
             'hidden': hidden,
-            'belief_logits': belief_logits,
-            'belief_probs': belief_probs,
             'family_logits': self.family_head(hidden),
-            'value': self.value_head(value_hidden),
-            'aux_value': self.aux_value_head(value_hidden),
-            'efficiency_bonus': self.efficiency_bonus_head(hidden),
+            'arg1_all': self.arg1_head(conditioned),
+            'arg2_all': self.arg2_head(conditioned),
+            'value': self.value_head(F.relu(self.value_hidden(hidden))),
         }
-
-    def conditioned_arg_logits(self, hidden, family_indices):
-        family_embed = self.family_embedding(family_indices)
-        conditioned = torch.cat([hidden, family_embed], dim=-1)
-        return self.arg1_head(conditioned), self.arg2_head(conditioned)
 
 
 class CnnPolicyValueModel:
     def __init__(
         self,
-        action_space_size,
-        hidden_size=32,
+        channels=32,
+        blocks=3,
+        hidden_size=256,
         learning_rate=0.001,
         seed=7,
-        state_dict=None,
         metadata=None,
         device='cpu',
     ):
-        self.action_space_size = int(action_space_size)
+        self.channels = int(channels)
+        self.blocks = int(blocks)
         self.hidden_size = int(hidden_size)
         self.learning_rate = float(learning_rate)
         self.seed = int(seed)
         self.metadata = dict(metadata or {})
-        self.backend = 'torch'
-        self.package_profile = package_profile()
-        self.codec = ActionCodec()
-        self.family_vocab = list(FAMILY_LABELS)
-        self.family_index = {label: idx for idx, label in enumerate(self.family_vocab)}
-        self.arg_vocab = list(ALL_TILES) + [NONE_TOKEN]
-        self.arg_index = {label: idx for idx, label in enumerate(self.arg_vocab)}
-        resolved_device, requested_device_name, resolved_device_name = resolve_device(device)
+        self.metadata.setdefault('feature_schema_version', FEATURE_SCHEMA_VERSION)
+
+        resolved_device, requested_name, resolved_name = resolve_device(device)
         self.device = resolved_device
-        self.requested_device = requested_device_name
-        self.resolved_device = resolved_device_name
+        self.requested_device = requested_name
+        self.resolved_device = resolved_name
         self.amp_enabled = bool(self.device.type == 'cuda')
-        if self.device.type == 'cuda':
-            try:
-                torch.set_float32_matmul_precision('high')
-            except Exception:
-                pass
-        self.amp_dtype = torch.bfloat16
-        try:
-            self.grad_scaler = torch.amp.GradScaler('cuda', enabled=self.amp_enabled)
-        except Exception:
-            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
-        self.compile_enabled = False
+        if self.amp_enabled:
+            torch.set_float32_matmul_precision('high')
+
         torch.manual_seed(self.seed)
+        self._sample_generator = torch.Generator(device='cpu')
+        self._sample_generator.manual_seed(self.seed)
 
-        self.calibration_temperature = max(1e-3, _safe_float(self.metadata.get('calibration_temperature', 1.0), 1.0))
-
-        self.eager_model = cast(Any, CnnCore(
+        self.model = CnnCore(
+            channels=self.channels,
+            blocks=self.blocks,
             hidden_size=self.hidden_size,
-            family_size=len(self.family_vocab),
-            arg_size=len(self.arg_vocab),
-        ).to(self.device))
-        self.model = self.eager_model
-        if self.device.type == 'cuda' and hasattr(torch, 'compile'):
-            try:
-                self.model = cast(Any, torch.compile(self.eager_model))
-                self.compile_enabled = True
-            except Exception:
-                self.compile_enabled = False
+        ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
-        if state_dict is not None:
-            self.load_state_dict(state_dict)
+    def _autocast(self):
+        if self.amp_enabled:
+            return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        return torch.autocast(device_type='cpu', enabled=False)
 
-    def _autocast_context(self):
-        if not self.amp_enabled:
-            return _NoOpContext()
-        return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
+    # ------------------------------------------------------------------
+    # Encoding
+    # ------------------------------------------------------------------
 
-    def _can_fallback_compile_error(self, exc):
-        message = str(exc)
-        lowered = message.lower()
-        return (
-            'inductorerror' in lowered
-            or 'torch._inductor' in lowered
-            or 'triton' in lowered
-            or 'failed to find c compiler' in lowered
-            or 'triton.knobs.build.impl' in lowered
-        )
+    def encode_features_batch(self, features_list):
+        planes = np.empty((len(features_list), PLANE_COUNT, TILE_COUNT), dtype=np.float32)
+        meta = np.empty((len(features_list), META_COUNT), dtype=np.float32)
+        for row, features in enumerate(features_list):
+            self._validate_features(features)
+            planes[row] = np.asarray(features['tile_planes'], dtype=np.float32)
+            meta[row] = np.asarray(features['meta'], dtype=np.float32)
+        return planes, meta
 
-    def _disable_compile_and_retry(self, tile_tensor, meta_tensor, exc):
-        if not self.compile_enabled:
-            raise exc
-        if not self._can_fallback_compile_error(exc):
-            raise exc
-
-        print('compile backend unavailable; falling back to eager execution')
-        self.compile_enabled = False
-        self.model = self.eager_model
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        return self.model(tile_tensor, meta_tensor)
-
-    def _forward(self, tile_tensor, meta_tensor):
-        try:
-            return self.model(tile_tensor, meta_tensor)
-        except Exception as exc:
-            return self._disable_compile_and_retry(tile_tensor, meta_tensor, exc)
-
-    def _zero_tile_tensor(self):
-        return torch.zeros((CHANNEL_COUNT, TILE_COUNT), dtype=torch.float32, device=self.device)
-
-    def _channel_tensor(self, values):
-        tensor = torch.zeros((TILE_COUNT,), dtype=torch.float32, device=self.device)
-        if isinstance(values, list):
-            limit = min(len(values), TILE_COUNT)
-            if limit > 0:
-                tensor[:limit] = torch.tensor(values[:limit], dtype=torch.float32, device=self.device)
-        return tensor
-
-    def _one_hot(self, value, vocabulary):
-        vector = [0.0] * len(vocabulary)
-        try:
-            index = vocabulary.index(value)
-        except ValueError:
-            index = 0
-        vector[index] = 1.0
-        return vector
-
-    def _safe_ratio(self, value, divisor):
-        divisor = float(divisor)
-        if divisor <= 0.0:
-            return 0.0
-        return max(0.0, min(1.0, float(value) / divisor))
-
-    def _extract_temporal_meta(self, features):
-        temporal = []
-        temporal_payload = features.get('opponent_temporal') if isinstance(features, dict) else None
-        if not isinstance(temporal_payload, list):
-            temporal_payload = []
-
-        for row in temporal_payload[:TEMPORAL_OPPONENT_COUNT]:
-            if not isinstance(row, dict):
-                row = {}
-            suits = row.get('suit_ratios', {}) if isinstance(row.get('suit_ratios', {}), dict) else {}
-            temporal.extend(
-                [
-                    self._safe_ratio(row.get('full_history_length', 0.0), 40.0),
-                    self._safe_ratio(row.get('pack_count', 0.0), 4.0),
-                    _safe_float(row.get('recent_honor_ratio', 0.0), 0.0),
-                    _safe_float(row.get('honor_ratio', 0.0), 0.0),
-                    _safe_float(suits.get('W', 0.0), 0.0),
-                    _safe_float(suits.get('B', 0.0), 0.0),
-                    _safe_float(suits.get('T', 0.0), 0.0),
-                ]
+    @staticmethod
+    def _validate_features(features):
+        if not isinstance(features, dict):
+            raise ValueError('Features must be a dict, got %r' % type(features))
+        version = features.get('schema_version')
+        if version != FEATURE_SCHEMA_VERSION:
+            raise ValueError(
+                'Feature schema mismatch: model expects v%d, got %r'
+                % (FEATURE_SCHEMA_VERSION, version)
             )
 
-        while len(temporal) < TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT:
-            temporal.append(0.0)
-        return temporal[: TEMPORAL_FEATURES_PER_OPPONENT * TEMPORAL_OPPONENT_COUNT]
+    @staticmethod
+    def encode_legal_actions(legal_actions_list, width=None):
+        """Pad legal-action lists into (family, arg1, arg2, mask) index arrays."""
+        if width is None:
+            width = max(1, max(len(actions) for actions in legal_actions_list))
+        batch = len(legal_actions_list)
+        family = np.zeros((batch, width), dtype=np.int64)
+        arg1 = np.full((batch, width), _NONE_INDEX, dtype=np.int64)
+        arg2 = np.full((batch, width), _NONE_INDEX, dtype=np.int64)
+        mask = np.zeros((batch, width), dtype=bool)
+        for row, actions in enumerate(legal_actions_list):
+            if len(actions) > width:
+                raise ValueError('Legal action list longer than width %d' % width)
+            for col, action in enumerate(actions):
+                fam_idx, a1_idx, a2_idx = encode_action(action)
+                family[row, col] = fam_idx
+                arg1[row, col] = a1_idx
+                arg2[row, col] = a2_idx
+                mask[row, col] = True
+        return family, arg1, arg2, mask
 
-    def _encode_features(self, features):
-        if not isinstance(features, dict):
-            features = {}
+    def _to_device(self, array, dtype=None):
+        tensor = torch.from_numpy(np.ascontiguousarray(array))
+        if dtype is not None:
+            tensor = tensor.to(dtype)
+        return tensor.to(self.device)
 
-        tile_tensor = self._zero_tile_tensor()
-
-        tile_tensor[0] = self._channel_tensor(features.get('hand_counts_norm', features.get('hand_counts', [])))
-        tile_tensor[1] = self._channel_tensor(features.get('seen_counts_norm', features.get('seen_counts', [])))
-        tile_tensor[2] = self._channel_tensor(features.get('self_discard_counts_norm', features.get('self_discard_counts', [])))
-        tile_tensor[3] = self._channel_tensor(features.get('pack_counts_norm', features.get('pack_counts', [])))
-
-        opponent_channels = features.get('opponent_discard_counts_norm', features.get('opponent_discard_counts', []))
-        if isinstance(opponent_channels, list):
-            for offset, channel in enumerate(opponent_channels[:3], start=4):
-                tile_tensor[offset] = self._channel_tensor(channel if isinstance(channel, list) else [])
-
-        tile_tensor[7] = self._channel_tensor(features.get('hand_counts', []))
-        tile_tensor[8] = self._channel_tensor(features.get('seen_counts', []))
-
-        shanten_norm = _safe_float(features.get('hand_shanten_norm', 0.0), 0.0)
-        acceptancy_norm = _safe_float(features.get('acceptancy_norm', 0.0), 0.0)
-        tile_tensor[9] = torch.full((TILE_COUNT,), shanten_norm, dtype=torch.float32, device=self.device)
-        tile_tensor[10] = torch.full((TILE_COUNT,), acceptancy_norm, dtype=torch.float32, device=self.device)
-
-        meta_values = []
-        meta = features.get('meta')
-        if isinstance(meta, list):
-            meta_values.extend(float(value) for value in meta[:8])
-        while len(meta_values) < 8:
-            meta_values.append(0.0)
-
-        request_type = _safe_int(features.get('request_type', 0), 0)
-        seat = _safe_int(features.get('seat', features.get('player_id', -1)), -1)
-        target_player = 1.0 if features.get('target_player') else 0.0
-
-        event_action = features.get('event_action')
-        raw_request = features.get('raw_request')
-
-        meta_values.extend([float(request_type), float(seat), target_player])
-        meta_values.extend(self._one_hot(event_action, EVENT_VOCAB))
-        meta_values.extend(self._one_hot(raw_request, REQUEST_VOCAB))
-
-        meta_values.extend(
-            [
-                _safe_float(features.get('schema_version', 0.0), 0.0),
-                _safe_float(features.get('hand_shanten_norm', 0.0), 0.0),
-                _safe_float(features.get('acceptancy_norm', 0.0), 0.0),
-                _safe_float((features.get('action_efficiency_deltas') or {}).get('PLAY', 0.0), 0.0),
-                _safe_float((features.get('action_efficiency_deltas') or {}).get('GANG', 0.0), 0.0),
-            ]
+    def _score_actions(self, outputs, family, arg1, arg2, mask):
+        """Gather per-action scores (B, L) with -inf on padded slots."""
+        arg_size = len(ARG_VOCAB)
+        family_scores = outputs['family_logits'].gather(1, family)
+        arg1_rows = outputs['arg1_all'].gather(
+            1, family.unsqueeze(-1).expand(-1, -1, arg_size)
         )
-        meta_values.extend(
-            [
-                _safe_float(features.get('can_hu_now', 0.0), 0.0),
-                _safe_float(features.get('fan_if_hu_now_norm', 0.0), 0.0),
-                _safe_float(features.get('fan_gap_to_8_norm', 0.0), 0.0),
-                _safe_float(features.get('is_tenpai', 0.0), 0.0),
-                _safe_float(features.get('wait_count_norm', 0.0), 0.0),
-                _safe_float(features.get('wait_fan_min_norm', 0.0), 0.0),
-                _safe_float(features.get('wait_fan_max_norm', 0.0), 0.0),
-                _safe_float(features.get('wait_fan_mean_norm', 0.0), 0.0),
-            ]
+        arg2_rows = outputs['arg2_all'].gather(
+            1, family.unsqueeze(-1).expand(-1, -1, arg_size)
         )
-        action_fan_deltas = features.get('action_fan_deltas', {})
-        if not isinstance(action_fan_deltas, dict):
-            action_fan_deltas = {}
-        for family in ACTION_FAMILY_ORDER:
-            meta_values.append(_safe_float(action_fan_deltas.get(family, 0.0), 0.0))
-        meta_values.extend(self._extract_temporal_meta(features))
+        arg1_scores = arg1_rows.gather(2, arg1.unsqueeze(-1)).squeeze(-1)
+        arg2_scores = arg2_rows.gather(2, arg2.unsqueeze(-1)).squeeze(-1)
+        scores = family_scores + arg1_scores + arg2_scores
+        return scores.masked_fill(~mask, float('-inf'))
 
-        while len(meta_values) < META_COUNT:
-            meta_values.append(0.0)
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
 
-        meta_tensor = torch.tensor(meta_values[:META_COUNT], dtype=torch.float32, device=self.device)
-        return tile_tensor.unsqueeze(0), meta_tensor.unsqueeze(0)
-
-    def _belief_target_from_features(self, features):
-        seen_counts = features.get('seen_counts') if isinstance(features, dict) else None
-        if not isinstance(seen_counts, list):
-            seen_counts = [0] * TILE_COUNT
-
-        target = []
-        total = 0.0
-        for seen in seen_counts[:TILE_COUNT]:
-            remaining = max(0.0, 4.0 - _safe_float(seen, 0.0))
-            target.append(float(remaining))
-            total += float(remaining)
-
-        while len(target) < TILE_COUNT:
-            target.append(0.0)
-
-        if total <= 0.0:
-            uniform = 1.0 / float(TILE_COUNT)
-            return [uniform for _ in range(TILE_COUNT)]
-
-        return [value / total for value in target]
-
-    def _belief_entropy(self, belief_probs):
-        probs = torch.clamp(belief_probs, min=1e-12)
-        return float((-(probs * torch.log(probs))).sum().item())
-
-    def _action_indices(self, action):
-        parts = action.split()
-        family = parts[0] if parts else 'PASS'
-        arg1 = parts[1] if len(parts) > 1 else NONE_TOKEN
-        arg2 = parts[2] if len(parts) > 2 else NONE_TOKEN
-        return (
-            self.family_index.get(family, 0),
-            self.arg_index.get(arg1, self.arg_index[NONE_TOKEN]),
-            self.arg_index.get(arg2, self.arg_index[NONE_TOKEN]),
-        )
-
-    def encode_action_targets(self, action):
-        return self._action_indices(action)
-
-    def _conditioned_arg_logits(self, outputs, family_index, batch_index=0):
-        family_tensor = torch.tensor([int(family_index)], dtype=torch.long, device=self.device)
-        hidden = outputs['hidden'][int(batch_index): int(batch_index) + 1]
-        return self.model.conditioned_arg_logits(hidden, family_tensor)
-
-    def _action_score(self, outputs, action, batch_index=0):
-        family_index, arg1_index, arg2_index = self._action_indices(action)
-        arg1_logits, arg2_logits = self._conditioned_arg_logits(outputs, family_index, batch_index=batch_index)
-        score = outputs['family_logits'][int(batch_index), family_index] + arg1_logits[0, arg1_index] + arg2_logits[0, arg2_index]
-        return score
-
-    def _belief_bonus(self, outputs, action, batch_index=0):
-        if 'PLAY ' not in action and 'GANG ' not in action and 'BUGANG ' not in action:
-            return 0.0
-        parts = action.split()
-        tile = parts[-1] if parts else NONE_TOKEN
-        tile_index = self.arg_index.get(tile)
-        if tile_index is None:
-            return 0.0
-        belief_probs = outputs.get('belief_probs')
-        if belief_probs is None:
-            return 0.0
-        return float(belief_probs[int(batch_index), tile_index].item())
-
-    def _efficiency_prior(self, features, action):
-        if not isinstance(features, dict):
-            return 0.0
-        deltas = features.get('action_efficiency_deltas', {})
-        if not isinstance(deltas, dict):
-            return 0.0
-        family = action.split()[0] if action else 'PASS'
-        return _safe_float(deltas.get(family, 0.0), 0.0)
-
-    def _legal_action_scores(self, outputs, legal_actions, features=None, belief_weight=0.0, efficiency_weight=0.0, batch_index=0):
-        scores = []
-        efficiency_tensor = outputs.get('efficiency_bonus', torch.tensor([[0.0]], device=self.device))
-        efficiency_bonus = _safe_float(efficiency_tensor[int(batch_index), 0].item(), 0.0)
-        for action in legal_actions:
-            score = self._action_score(outputs, action, batch_index=batch_index)
-            if belief_weight:
-                score = score + float(belief_weight) * self._belief_bonus(outputs, action, batch_index=batch_index)
-            if efficiency_weight:
-                score = score + float(efficiency_weight) * efficiency_bonus * self._efficiency_prior(features, action)
-            scores.append(score)
-        return torch.stack(scores, dim=0)
-
-    def set_calibration_temperature(self, temperature):
-        self.calibration_temperature = max(1e-3, _safe_float(temperature, 1.0))
-        self.metadata['calibration_temperature'] = float(self.calibration_temperature)
-
-    def _temperature_adjusted_scores(self, scores, temperature=None):
-        if temperature is None:
-            temperature = self.calibration_temperature
-        temperature = max(1e-3, _safe_float(temperature, 1.0))
-        return scores / temperature
-
-    def policy_info_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
+    def policy_info_from_features(self, features, legal_actions, temperature=1.0):
         if not legal_actions:
-            return {
-                'actions': [],
-                'scores': [],
-                'probabilities': [],
-                'log_probabilities': [],
-                'belief_probs': [],
-                'belief_entropy': 0.0,
-                'entropy': 0.0,
-                'value': 0.0,
-                'aux_value': 0.0,
-                'efficiency_bonus': 0.0,
-            }
+            raise ValueError('policy_info_from_features requires at least one legal action')
+
+        planes, meta = self.encode_features_batch([features])
+        family, arg1, arg2, mask = self.encode_legal_actions([list(legal_actions)])
 
         self.model.eval()
         with torch.no_grad():
-            tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self._forward(tile_tensor, meta_tensor)
-            raw_scores = self._legal_action_scores(
+            outputs = self.model(self._to_device(planes), self._to_device(meta))
+            scores = self._score_actions(
                 outputs,
-                legal_actions,
-                features=features,
-                belief_weight=belief_weight,
-                efficiency_weight=efficiency_weight,
+                self._to_device(family),
+                self._to_device(arg1),
+                self._to_device(arg2),
+                self._to_device(mask),
             )
-            scores = self._temperature_adjusted_scores(raw_scores, temperature=temperature)
-            log_probabilities = torch.log_softmax(scores, dim=0)
-            probabilities = torch.softmax(scores, dim=0)
-            entropy = float((-(probabilities * log_probabilities)).sum().item())
+            scores = scores / max(1e-3, float(temperature))
+            log_probs = torch.log_softmax(scores, dim=1)[0]
+            probs = torch.softmax(scores, dim=1)[0]
+            finite = torch.isfinite(log_probs)
+            entropy = float(-(probs[finite] * log_probs[finite]).sum().item())
             value = float(outputs['value'][0, 0].item())
-            aux_value = float(outputs['aux_value'][0, 0].item())
-            efficiency_bonus = float(outputs['efficiency_bonus'][0, 0].item())
-            belief_probs = outputs.get('belief_probs')
-            if belief_probs is None:
-                belief_list = []
-                belief_entropy = 0.0
-            else:
-                belief_list = [float(probability.item()) for probability in belief_probs[0]]
-                belief_entropy = self._belief_entropy(belief_probs)
 
         return {
             'actions': list(legal_actions),
-            'scores': [float(score.item()) for score in scores],
-            'probabilities': [float(probability.item()) for probability in probabilities],
-            'log_probabilities': [float(log_probability.item()) for log_probability in log_probabilities],
-            'belief_probs': belief_list,
-            'belief_entropy': belief_entropy,
+            'probabilities': [float(p.item()) for p in probs],
+            'log_probabilities': [float(lp.item()) for lp in log_probs],
             'entropy': entropy,
             'value': value,
-            'aux_value': aux_value,
-            'efficiency_bonus': efficiency_bonus,
         }
 
-    def sample_action_from_features(self, features, legal_actions, temperature=1.0, greedy=False, belief_weight=0.0, efficiency_weight=0.0):
-        info = self.policy_info_from_features(
-            features,
-            legal_actions,
-            belief_weight=belief_weight,
-            efficiency_weight=efficiency_weight,
-            temperature=temperature,
+    def choose_action_from_features(self, features, legal_actions):
+        """Deterministic greedy choice: highest probability, ties by name."""
+        info = self.policy_info_from_features(features, legal_actions)
+        ranked = sorted(
+            zip(info['actions'], info['probabilities']),
+            key=lambda item: (-item[1], item[0]),
         )
-        actions = info['actions']
-        if not actions:
-            return None, info
-
-        if greedy:
-            index = max(range(len(actions)), key=lambda idx: (info['probabilities'][idx], actions[idx]))
-        else:
-            probabilities = torch.tensor(info['probabilities'], dtype=torch.float32, device=self.device)
-            if float(temperature) != 1.0:
-                logits = torch.log(torch.clamp(probabilities, min=1e-12)) / max(1e-3, float(temperature))
-                probabilities = torch.softmax(logits, dim=0)
-            index = int(torch.multinomial(probabilities, 1).item())
-
-        selected_action = actions[index]
-        selected_log_prob = info['log_probabilities'][index]
-        selected_probability = info['probabilities'][index]
-        info = dict(info)
-        info['selected_action'] = selected_action
-        info['selected_index'] = index
-        info['selected_log_prob'] = float(selected_log_prob)
-        info['selected_probability'] = float(selected_probability)
-        return selected_action, info
-
-    def action_distribution_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
-        info = self.policy_info_from_features(
-            features,
-            legal_actions,
-            belief_weight=belief_weight,
-            efficiency_weight=efficiency_weight,
-            temperature=temperature,
-        )
-        return {action: probability for action, probability in zip(info['actions'], info['probabilities'])}
-
-    def decode_conditioned_action_from_features(self, features, legal_actions=None, deterministic=True, temperature=1.0):
-        self.model.eval()
-        with torch.no_grad():
-            tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self._forward(tile_tensor, meta_tensor)
-            family_logits = outputs['family_logits'][0]
-            if deterministic:
-                family_index = int(torch.argmax(family_logits).item())
-            else:
-                family_probs = torch.softmax(family_logits / max(1e-3, float(temperature)), dim=0)
-                family_index = int(torch.multinomial(family_probs, 1).item())
-
-            arg1_logits, arg2_logits = self._conditioned_arg_logits(outputs, family_index)
-            arg1_index = int(torch.argmax(arg1_logits[0]).item())
-            arg2_index = int(torch.argmax(arg2_logits[0]).item())
-
-            family = self.family_vocab[family_index]
-            arg1 = self.arg_vocab[arg1_index]
-            arg2 = self.arg_vocab[arg2_index]
-
-            if family in ('PASS', 'HU'):
-                candidate = family
-            elif family == 'GANG' and arg1 == NONE_TOKEN:
-                candidate = 'GANG'
-            elif family in ('PLAY', 'GANG', 'BUGANG', 'PENG'):
-                candidate = '%s %s' % (family, arg1)
-            elif family == 'CHI':
-                candidate = '%s %s %s' % (family, arg1, arg2)
-            else:
-                candidate = 'PASS'
-
-            if legal_actions:
-                if candidate in legal_actions:
-                    return candidate
-                info = self.policy_info_from_features(features, legal_actions)
-                if info['actions']:
-                    best_idx = max(range(len(info['actions'])), key=lambda idx: info['probabilities'][idx])
-                    return info['actions'][best_idx]
-                return None
-            return candidate
-
-    def choose_action_from_features(self, features, legal_actions, belief_weight=0.0, efficiency_weight=0.0, temperature=None):
-        distribution = self.action_distribution_from_features(
-            features,
-            legal_actions,
-            belief_weight=belief_weight,
-            efficiency_weight=efficiency_weight,
-            temperature=temperature,
-        )
-        if not distribution:
-            return None
-        ranked = sorted(distribution.items(), key=lambda item: (-item[1], item[0]))
         return ranked[0][0]
 
+    def sample_action_from_features(self, features, legal_actions, temperature=1.0, greedy=False):
+        info = self.policy_info_from_features(features, legal_actions, temperature=temperature)
+        actions = info['actions']
+        if greedy or float(temperature) <= 0.0:
+            index = max(
+                range(len(actions)),
+                key=lambda idx: (info['probabilities'][idx], actions[idx]),
+            )
+        else:
+            probs = torch.tensor(info['probabilities'], dtype=torch.float32)
+            index = int(torch.multinomial(probs, 1, generator=self._sample_generator).item())
+        info = dict(info)
+        info['selected_action'] = actions[index]
+        info['selected_index'] = index
+        info['selected_log_prob'] = float(info['log_probabilities'][index])
+        return actions[index], info
+
     def estimate_value_from_features(self, features):
+        planes, meta = self.encode_features_batch([features])
         self.model.eval()
         with torch.no_grad():
-            tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self._forward(tile_tensor, meta_tensor)
+            outputs = self.model(self._to_device(planes), self._to_device(meta))
             return float(outputs['value'][0, 0].item())
 
-    def _belief_consistency_penalty(self, outputs, features, batch_index=0):
-        if not isinstance(features, dict):
-            return torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        seen = features.get('seen_counts', [])
-        if not isinstance(seen, list) or not seen:
-            return torch.tensor(0.0, dtype=torch.float32, device=self.device)
-
-        indices = []
-        for idx, count in enumerate(seen[:TILE_COUNT]):
-            if _safe_float(count, 0.0) >= 4.0:
-                indices.append(idx)
-
-        if not indices:
-            return torch.tensor(0.0, dtype=torch.float32, device=self.device)
-
-        probs = outputs['belief_probs'][int(batch_index), indices]
-        return probs.mean()
-
-    def _encode_batch_features(self, features_list):
-        tile_tensors = []
-        meta_tensors = []
-        for features in features_list:
-            tile_tensor, meta_tensor = self._encode_features(features)
-            tile_tensors.append(tile_tensor.squeeze(0))
-            meta_tensors.append(meta_tensor.squeeze(0))
-        return torch.stack(tile_tensors, dim=0), torch.stack(meta_tensors, dim=0)
+    # ------------------------------------------------------------------
+    # Supervised training on a pre-encoded dataset
+    # ------------------------------------------------------------------
 
     def _preencoded_batch(self, preencoded, indices):
         idx = np.asarray(indices, dtype=np.int64)
-        tile = torch.tensor(preencoded['tile_tensor'][idx], dtype=torch.float32, device=self.device)
-        meta = torch.tensor(preencoded['meta_tensor'][idx], dtype=torch.float32, device=self.device)
-        family = torch.tensor(preencoded['family_target'][idx], dtype=torch.long, device=self.device)
-        arg1 = torch.tensor(preencoded['arg1_target'][idx], dtype=torch.long, device=self.device)
-        arg2 = torch.tensor(preencoded['arg2_target'][idx], dtype=torch.long, device=self.device)
-        reward = torch.tensor(preencoded['reward'][idx], dtype=torch.float32, device=self.device).unsqueeze(1)
-        decision_mask = torch.tensor(preencoded['decision_mask'][idx], dtype=torch.bool, device=self.device)
-        belief_target = torch.tensor(preencoded['belief_target'][idx], dtype=torch.float32, device=self.device)
-        seen_mask = torch.tensor(preencoded['seen_full_mask'][idx], dtype=torch.float32, device=self.device)
-        return tile, meta, family, arg1, arg2, reward, decision_mask, belief_target, seen_mask
+        # Planes are stored quantized (value * 4 as uint8, lossless for the
+        # 0/0.25/0.5/0.75/1.0 grid) to keep caches 4x smaller than float32.
+        planes = self._to_device(preencoded['tile_planes_q'][idx].astype(np.float32) * 0.25)
+        meta = self._to_device(preencoded['meta'][idx].astype(np.float32, copy=False))
+        family = self._to_device(preencoded['legal_family'][idx].astype(np.int64, copy=False))
+        arg1 = self._to_device(preencoded['legal_arg1'][idx].astype(np.int64, copy=False))
+        arg2 = self._to_device(preencoded['legal_arg2'][idx].astype(np.int64, copy=False))
+        lengths = preencoded['legal_len'][idx].astype(np.int64, copy=False)
+        width = family.shape[1]
+        mask = self._to_device(np.arange(width)[None, :] < lengths[:, None])
+        target = self._to_device(preencoded['target_index'][idx].astype(np.int64, copy=False))
+        reward = self._to_device(
+            preencoded['reward'][idx].astype(np.float32, copy=False)
+        ).unsqueeze(1)
+        return planes, meta, family, arg1, arg2, mask, target, reward, lengths
 
-    def _vectorized_policy_loss(self, outputs, family_target, arg1_target, arg2_target, decision_mask, policy_weight, forced_policy_weight):
-        family_loss = F.cross_entropy(outputs['family_logits'], family_target, reduction='none')
-        arg1_logits, arg2_logits = self.model.conditioned_arg_logits(outputs['hidden'], family_target)
-        arg1_loss = F.cross_entropy(arg1_logits, arg1_target, reduction='none')
-        arg2_loss = F.cross_entropy(arg2_logits, arg2_target, reduction='none')
-        per_sample = family_loss + arg1_loss + arg2_loss
-        weights = torch.where(decision_mask, torch.full_like(per_sample, float(policy_weight)), torch.full_like(per_sample, float(forced_policy_weight)))
-        return (weights * per_sample).mean(), arg1_logits, arg2_logits
-
-    def train_preencoded_batch(
-        self,
-        preencoded,
-        indices,
-        policy_weight=1.0,
-        value_weight=0.5,
-        belief_weight=0.25,
-        forced_policy_weight=0.0,
-        aux_value_weight=0.15,
-        efficiency_weight=0.1,
-        belief_consistency_weight=0.1,
-    ):
-        tile, meta, family, arg1, arg2, reward, decision_mask, belief_target, seen_mask = self._preencoded_batch(preencoded, indices)
-
+    def train_preencoded_batch(self, preencoded, indices, policy_weight=1.0, value_weight=0.5):
+        planes, meta, family, arg1, arg2, mask, target, reward, lengths = self._preencoded_batch(
+            preencoded, indices
+        )
         self.model.train()
-        with self._autocast_context():
-            outputs = self._forward(tile, meta)
-            policy_loss, arg1_logits, arg2_logits = self._vectorized_policy_loss(
-                outputs,
-                family,
-                arg1,
-                arg2,
-                decision_mask,
-                policy_weight,
-                forced_policy_weight,
-            )
+        with self._autocast():
+            outputs = self.model(planes, meta)
+            scores = self._score_actions(outputs, family, arg1, arg2, mask)
+            policy_loss = F.cross_entropy(scores, target)
             value_loss = F.mse_loss(outputs['value'], reward)
-            aux_target = torch.tanh(reward)
-            aux_value_loss = F.mse_loss(outputs['aux_value'], aux_target)
-            belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
-            seen_count = torch.sum(seen_mask, dim=1)
-            seen_penalty = torch.sum(outputs['belief_probs'] * seen_mask, dim=1)
-            seen_penalty = torch.where(seen_count > 0, seen_penalty / torch.clamp(seen_count, min=1.0), torch.zeros_like(seen_penalty))
-            belief_consistency_loss = seen_penalty.mean()
+            total_loss = float(policy_weight) * policy_loss + float(value_weight) * value_loss
 
-            total_loss = (
-                policy_loss
-                + float(value_weight) * value_loss
-                + float(aux_value_weight) * aux_value_loss
-                + float(belief_weight) * belief_loss
-                + float(belief_consistency_weight) * belief_consistency_loss
-                + float(efficiency_weight) * torch.abs(outputs['efficiency_bonus']).mean()
-            )
-
-        self.optimizer.zero_grad()
-        if self.amp_enabled:
-            self.grad_scaler.scale(total_loss).backward()
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            total_loss.backward()
-            self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
+        self.optimizer.step()
 
         with torch.no_grad():
-            pred_family = torch.argmax(outputs['family_logits'], dim=1)
-            pred_arg1 = torch.argmax(arg1_logits, dim=1)
-            pred_arg2 = torch.argmax(arg2_logits, dim=1)
-            action_hit_tensor = ((pred_family == family) & (pred_arg1 == arg1) & (pred_arg2 == arg2)).to(torch.int32)
-            decision_int = decision_mask.to(torch.int32)
+            predictions = torch.argmax(scores, dim=1)
+            hits = (predictions == target).to(torch.int64)
+            decision_mask = self._to_device(lengths > 1)
+            decision_hits = int((hits * decision_mask.to(torch.int64)).sum().item())
 
+        count = int(len(indices))
         return {
-            'samples': int(len(indices)),
-            'action_loss': float(policy_loss.item()) * float(len(indices)),
-            'value_loss': float(value_loss.item()) * float(len(indices)),
-            'aux_value_loss': float(aux_value_loss.item()) * float(len(indices)),
-            'belief_loss': float(belief_loss.item()) * float(len(indices)),
-            'belief_consistency_loss': float(belief_consistency_loss.item()) * float(len(indices)),
-            'weighted_total_loss': float(total_loss.item()) * float(len(indices)),
-            'action_hits': int(torch.sum(action_hit_tensor).item()),
-            'decision_samples': int(torch.sum(decision_int).item()),
-            'decision_hits': int(torch.sum(action_hit_tensor * decision_int).item()),
-            'forced_samples': int(len(indices) - int(torch.sum(decision_int).item())),
-            'efficiency_bonus': float(torch.sum(outputs['efficiency_bonus']).item()),
+            'samples': count,
+            'policy_loss': float(policy_loss.item()) * count,
+            'value_loss': float(value_loss.item()) * count,
+            'action_hits': int(hits.sum().item()),
+            'decision_samples': int(decision_mask.sum().item()),
+            'decision_hits': decision_hits,
         }
 
     def fit_preencoded(
         self,
         preencoded,
         epochs=1,
-        batch_size=256,
+        batch_size=512,
         shuffle=True,
-        verbose=False,
+        sample_indices=None,
         policy_weight=1.0,
         value_weight=0.5,
-        belief_weight=0.25,
-        forced_policy_weight=0.0,
-        aux_value_weight=0.15,
-        efficiency_weight=0.1,
-        belief_consistency_weight=0.1,
         show_progress=False,
-        sample_indices=None,
     ):
-        total_all = int(len(preencoded['family_target']))
-        if sample_indices is None:
-            base_indices = np.arange(total_all, dtype=np.int64)
-        else:
-            base_indices = np.asarray(sample_indices, dtype=np.int64)
+        total_all = int(len(preencoded['target_index']))
+        base_indices = (
+            np.arange(total_all, dtype=np.int64)
+            if sample_indices is None
+            else np.asarray(sample_indices, dtype=np.int64)
+        )
         total = int(len(base_indices))
-        if total <= 0:
-            return {
-                'samples': 0,
-                'action_loss': 0.0,
-                'value_loss': 0.0,
-                'aux_value_loss': 0.0,
-                'belief_loss': 0.0,
-                'belief_consistency_loss': 0.0,
-                'efficiency_bonus': 0.0,
-                'action_hits': 0,
-                'weighted_total_loss': 0.0,
-                'decision_samples': 0,
-                'decision_hits': 0,
-                'forced_samples': 0,
-            }
-        batch_size = max(1, int(batch_size))
         stats = {
             'samples': 0,
-            'action_loss': 0.0,
+            'policy_loss': 0.0,
             'value_loss': 0.0,
-            'aux_value_loss': 0.0,
-            'belief_loss': 0.0,
-            'belief_consistency_loss': 0.0,
-            'efficiency_bonus': 0.0,
             'action_hits': 0,
-            'weighted_total_loss': 0.0,
             'decision_samples': 0,
             'decision_hits': 0,
-            'forced_samples': 0,
         }
+        if total <= 0:
+            return stats
 
+        batch_size = max(1, int(batch_size))
         for epoch_idx in range(max(1, int(epochs))):
             indices = np.array(base_indices, copy=True)
             if shuffle:
-                rng = np.random.default_rng(self.seed + epoch_idx)
-                rng.shuffle(indices)
-
-            if verbose:
-                print('preencoded epoch %d/%d samples=%d batch_size=%d' % (epoch_idx + 1, int(epochs), total, batch_size))
-
-            epoch_label = 'epoch %d/%d' % (epoch_idx + 1, int(epochs))
-            epoch_seen = 0
-
+                np.random.default_rng(self.seed + epoch_idx).shuffle(indices)
+            label = 'epoch %d/%d' % (epoch_idx + 1, max(1, int(epochs)))
+            seen = 0
             for start in range(0, total, batch_size):
-                batch_indices = indices[start: start + batch_size]
+                batch = indices[start: start + batch_size]
                 result = self.train_preencoded_batch(
-                    preencoded,
-                    batch_indices,
-                    policy_weight=policy_weight,
-                    value_weight=value_weight,
-                    belief_weight=belief_weight,
-                    forced_policy_weight=forced_policy_weight,
-                    aux_value_weight=aux_value_weight,
-                    efficiency_weight=efficiency_weight,
-                    belief_consistency_weight=belief_consistency_weight,
+                    preencoded, batch, policy_weight=policy_weight, value_weight=value_weight
                 )
                 for key in stats:
-                    stats[key] += result.get(key, 0)
-                epoch_seen += int(len(batch_indices))
+                    stats[key] += result[key]
+                seen += len(batch)
                 if show_progress:
-                    _print_progress_bar(epoch_label, epoch_seen, total)
-
-            if show_progress and epoch_seen < total:
-                _print_progress_bar(epoch_label, total, total)
-
+                    _print_progress_bar(label, seen, total)
         return stats
 
-    def evaluate_preencoded_loss(self, preencoded, batch_size=1024):
-        return self.evaluate_preencoded_loss_for_indices(preencoded, sample_indices=None, batch_size=batch_size)
+    def evaluate_preencoded(self, preencoded, sample_indices=None, batch_size=2048, top_ks=(1, 3)):
+        total_all = int(len(preencoded['target_index']))
+        indices = (
+            np.arange(total_all, dtype=np.int64)
+            if sample_indices is None
+            else np.asarray(sample_indices, dtype=np.int64)
+        )
+        top_ks = sorted(set(int(k) for k in top_ks if int(k) > 0))
+        metrics = {
+            'evaluated': 0,
+            'decision_evaluated': 0,
+            'masked_cross_entropy': 0.0,
+            'value_mse': 0.0,
+            'topk_accuracy': {str(k): 0.0 for k in top_ks},
+        }
+        if len(indices) <= 0:
+            return metrics
 
-    def evaluate_preencoded_loss_for_indices(self, preencoded, sample_indices=None, batch_size=1024):
-        total_all = int(len(preencoded['family_target']))
-        if sample_indices is None:
-            eval_indices = np.arange(total_all, dtype=np.int64)
-        else:
-            eval_indices = np.asarray(sample_indices, dtype=np.int64)
-        total = int(len(eval_indices))
-        if total <= 0:
-            return None, 0
-
-        batch_size = max(1, int(batch_size))
         nll_sum = 0.0
-        evaluated = 0
+        mse_sum = 0.0
+        decision_count = 0
+        hit_counts = {k: 0 for k in top_ks}
+
         self.model.eval()
         with torch.no_grad():
-            for start in range(0, total, batch_size):
-                idx = eval_indices[start: min(start + batch_size, total)]
-                tile, meta, family, arg1, arg2, _reward, _decision_mask, _belief_target, _seen_mask = self._preencoded_batch(preencoded, idx)
-                outputs = self._forward(tile, meta)
-                family_loss = F.cross_entropy(outputs['family_logits'], family, reduction='none')
-                arg1_logits, arg2_logits = self.model.conditioned_arg_logits(outputs['hidden'], family)
-                arg1_loss = F.cross_entropy(arg1_logits, arg1, reduction='none')
-                arg2_loss = F.cross_entropy(arg2_logits, arg2, reduction='none')
-                nll_sum += float(torch.sum(family_loss + arg1_loss + arg2_loss).item())
-                evaluated += int(len(idx))
-
-        if evaluated <= 0:
-            return None, 0
-        return nll_sum / float(evaluated), evaluated
-
-    def train_batch_step(
-        self,
-        batch_records,
-        policy_weight=1.0,
-        value_weight=0.5,
-        belief_weight=0.25,
-        forced_policy_weight=0.0,
-        aux_value_weight=0.15,
-        efficiency_weight=0.1,
-        belief_consistency_weight=0.1,
-    ):
-        if not batch_records:
-            return {
-                'samples': 0,
-                'action_loss': 0.0,
-                'value_loss': 0.0,
-                'aux_value_loss': 0.0,
-                'belief_loss': 0.0,
-                'belief_consistency_loss': 0.0,
-                'weighted_total_loss': 0.0,
-                'action_hits': 0,
-                'decision_samples': 0,
-                'decision_hits': 0,
-                'forced_samples': 0,
-                'efficiency_bonus': 0.0,
-            }
-
-        prepared = []
-        feature_list = []
-        for record in batch_records:
-            legal_actions = list(record.legal_actions or [])
-            if record.action not in legal_actions:
-                legal_actions.append(record.action)
-            is_decision_state = len(legal_actions) > 1
-            record_policy_weight = float(policy_weight) if is_decision_state else float(forced_policy_weight)
-            prepared.append((record, legal_actions, is_decision_state, record_policy_weight))
-            feature_list.append(record.features)
-
-        self.model.train()
-        with self._autocast_context():
-            tile_tensor, meta_tensor = self._encode_batch_features(feature_list)
-            outputs = self._forward(tile_tensor, meta_tensor)
-
-            sample_losses = []
-            sample_action_losses = []
-            sample_value_losses = []
-            sample_aux_value_losses = []
-            sample_belief_losses = []
-            sample_belief_consistency_losses = []
-            action_hits = 0
-            decision_samples = 0
-            decision_hits = 0
-            forced_samples = 0
-            efficiency_bonus_sum = 0.0
-
-            for idx, (record, legal_actions, is_decision_state, record_policy_weight) in enumerate(prepared):
-                scores = self._legal_action_scores(
-                    outputs,
-                    legal_actions,
-                    features=record.features,
-                    belief_weight=0.0,
-                    efficiency_weight=efficiency_weight,
-                    batch_index=idx,
-                ).unsqueeze(0)
-                target_index = torch.tensor([legal_actions.index(record.action)], dtype=torch.long, device=self.device)
-                action_loss = F.cross_entropy(scores, target_index)
-
-                reward_value = float(_safe_float(record.reward, 0.0))
-                value_target = torch.tensor([[reward_value]], dtype=torch.float32, device=self.device)
-                value_pred = outputs['value'][idx: idx + 1]
-                aux_pred = outputs['aux_value'][idx: idx + 1]
-                value_loss = F.mse_loss(value_pred, value_target)
-                aux_target = torch.tanh(value_target)
-                aux_value_loss = F.mse_loss(aux_pred, aux_target)
-
-                belief_target = torch.tensor([self._belief_target_from_features(record.features)], dtype=torch.float32, device=self.device)
-                belief_pred = outputs['belief_probs'][idx: idx + 1]
-                belief_loss = F.kl_div(torch.log(torch.clamp(belief_pred, min=1e-12)), belief_target, reduction='batchmean')
-                belief_consistency_loss = self._belief_consistency_penalty(outputs, record.features, batch_index=idx)
-
-                sample_loss = (
-                    float(record_policy_weight) * action_loss
-                    + float(value_weight) * value_loss
-                    + float(aux_value_weight) * aux_value_loss
-                    + float(belief_weight) * belief_loss
-                    + float(belief_consistency_weight) * belief_consistency_loss
+            for start in range(0, len(indices), max(1, int(batch_size))):
+                batch = indices[start: start + max(1, int(batch_size))]
+                planes, meta, family, arg1, arg2, mask, target, reward, lengths = (
+                    self._preencoded_batch(preencoded, batch)
                 )
+                outputs = self.model(planes, meta)
+                scores = self._score_actions(outputs, family, arg1, arg2, mask)
+                log_probs = torch.log_softmax(scores, dim=1)
+                target_log_probs = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
 
-                with torch.no_grad():
-                    probabilities = torch.softmax(scores.squeeze(0), dim=0)
-                    action_hit = int(int(torch.argmax(probabilities).item()) == int(target_index.item()))
-                    action_hits += action_hit
-                    if is_decision_state:
-                        decision_samples += 1
-                        decision_hits += action_hit
-                    else:
-                        forced_samples += 1
+                decision_rows = self._to_device(lengths > 1)
+                nll_sum += float((-target_log_probs * decision_rows).sum().item())
+                decision_count += int(decision_rows.sum().item())
+                mse_sum += float(F.mse_loss(outputs['value'], reward, reduction='sum').item())
 
-                sample_losses.append(sample_loss)
-                sample_action_losses.append(float(action_loss.item()))
-                sample_value_losses.append(float(value_loss.item()))
-                sample_aux_value_losses.append(float(aux_value_loss.item()))
-                sample_belief_losses.append(float(belief_loss.item()))
-                sample_belief_consistency_losses.append(float(belief_consistency_loss.item()))
-                efficiency_bonus_sum += float(outputs['efficiency_bonus'][idx, 0].detach().item())
+                ranked = torch.argsort(scores, dim=1, descending=True)
+                for k in top_ks:
+                    in_top = (ranked[:, :k] == target.unsqueeze(1)).any(dim=1)
+                    hit_counts[k] += int((in_top & decision_rows).sum().item())
 
-            batch_loss = torch.stack(sample_losses, dim=0).mean()
+                metrics['evaluated'] += int(len(batch))
 
-        self.optimizer.zero_grad()
-        if self.amp_enabled:
-            self.grad_scaler.scale(batch_loss).backward()
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            batch_loss.backward()
-            self.optimizer.step()
+        metrics['decision_evaluated'] = decision_count
+        if decision_count > 0:
+            metrics['masked_cross_entropy'] = nll_sum / float(decision_count)
+            for k in top_ks:
+                metrics['topk_accuracy'][str(k)] = hit_counts[k] / float(decision_count)
+        if metrics['evaluated'] > 0:
+            metrics['value_mse'] = mse_sum / float(metrics['evaluated'])
+        return metrics
 
-        return {
-            'samples': len(batch_records),
-            'action_loss': float(sum(sample_action_losses)),
-            'value_loss': float(sum(sample_value_losses)),
-            'aux_value_loss': float(sum(sample_aux_value_losses)),
-            'belief_loss': float(sum(sample_belief_losses)),
-            'belief_consistency_loss': float(sum(sample_belief_consistency_losses)),
-            'weighted_total_loss': float(sum(float(loss.item()) for loss in sample_losses)),
-            'action_hits': int(action_hits),
-            'decision_samples': int(decision_samples),
-            'decision_hits': int(decision_hits),
-            'forced_samples': int(forced_samples),
-            'efficiency_bonus': float(efficiency_bonus_sum),
-        }
+    # ------------------------------------------------------------------
+    # PPO fine-tuning
+    # ------------------------------------------------------------------
 
-    def train_step(
+    def ppo_update(
         self,
-        features,
-        legal_actions,
-        action,
-        reward,
-        policy_weight=1.0,
-        value_weight=0.5,
-        belief_weight=0.25,
-        aux_value_weight=0.15,
-        efficiency_weight=0.1,
-        belief_consistency_weight=0.1,
+        transitions,
+        clip_range=0.2,
+        entropy_coef=0.01,
+        value_coef=0.5,
+        epochs=4,
+        minibatch_size=256,
     ):
-        if not legal_actions:
-            legal_actions = [action]
-        if action not in legal_actions:
-            legal_actions = list(legal_actions) + [action]
-        legal_action_count = len(legal_actions)
-        is_decision_state = legal_action_count > 1
+        """Batched PPO update over a list of transition dicts.
+
+        Each transition needs: features, legal_actions, action,
+        old_log_prob, advantage, return_target.
+        """
+        if not transitions:
+            return {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+
+        planes_np, meta_np = self.encode_features_batch(
+            [t['features'] for t in transitions]
+        )
+        family_np, arg1_np, arg2_np, mask_np = self.encode_legal_actions(
+            [list(t['legal_actions']) for t in transitions]
+        )
+        action_index_np = np.array(
+            [list(t['legal_actions']).index(t['action']) for t in transitions],
+            dtype=np.int64,
+        )
+        old_log_prob_np = np.array(
+            [float(t['old_log_prob']) for t in transitions], dtype=np.float32
+        )
+        advantage_np = np.array(
+            [float(t['advantage']) for t in transitions], dtype=np.float32
+        )
+        if len(advantage_np) > 1 and float(advantage_np.std()) > 1e-8:
+            advantage_np = (advantage_np - advantage_np.mean()) / (advantage_np.std() + 1e-8)
+        return_np = np.array(
+            [float(t['return_target']) for t in transitions], dtype=np.float32
+        )
+
+        planes = self._to_device(planes_np)
+        meta = self._to_device(meta_np)
+        family = self._to_device(family_np)
+        arg1 = self._to_device(arg1_np)
+        arg2 = self._to_device(arg2_np)
+        mask = self._to_device(mask_np)
+        action_index = self._to_device(action_index_np)
+        old_log_prob = self._to_device(old_log_prob_np)
+        advantage = self._to_device(advantage_np)
+        return_target = self._to_device(return_np).unsqueeze(1)
+
+        total = len(transitions)
+        stats = {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+        rng = np.random.default_rng(self.seed)
 
         self.model.train()
-        with self._autocast_context():
-            tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self._forward(tile_tensor, meta_tensor)
-
-            scores = self._legal_action_scores(outputs, legal_actions, features=features, belief_weight=0.0, efficiency_weight=efficiency_weight).unsqueeze(0)
-            target_index = torch.tensor([legal_actions.index(action)], dtype=torch.long, device=self.device)
-            action_loss = F.cross_entropy(scores, target_index)
-
-            value_target = torch.tensor([[float(_safe_float(reward, 0.0))]], dtype=torch.float32, device=self.device)
-            value_loss = F.mse_loss(outputs['value'], value_target)
-            aux_target = torch.tanh(value_target)
-            aux_value_loss = F.mse_loss(outputs['aux_value'], aux_target)
-
-            belief_target = torch.tensor([self._belief_target_from_features(features)], dtype=torch.float32, device=self.device)
-            belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
-            belief_consistency_loss = self._belief_consistency_penalty(outputs, features)
-
-            loss = (
-                float(policy_weight) * action_loss
-                + float(value_weight) * value_loss
-                + float(aux_value_weight) * aux_value_loss
-                + float(belief_weight) * belief_loss
-                + float(belief_consistency_weight) * belief_consistency_loss
-            )
-        self.optimizer.zero_grad()
-        if self.amp_enabled:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            self.optimizer.step()
-
-        with torch.no_grad():
-            probabilities = torch.softmax(scores.squeeze(0), dim=0)
-            action_hit = int(int(torch.argmax(probabilities).item()) == int(target_index.item()))
-
-        return {
-            'action_loss': float(action_loss.item()),
-            'value_loss': float(value_loss.item()),
-            'aux_value_loss': float(aux_value_loss.item()),
-            'belief_loss': float(belief_loss.item()),
-            'belief_consistency_loss': float(belief_consistency_loss.item()),
-            'weighted_total_loss': float(loss.item()),
-            'action_hit': action_hit,
-            'is_decision_state': bool(is_decision_state),
-            'legal_action_count': int(legal_action_count),
-            'efficiency_bonus': float(outputs['efficiency_bonus'][0, 0].detach().item()),
-        }
-
-    def ppo_train_step(self, features, legal_actions, action, advantage, return_target, old_log_prob=None, clip_range=0.2, entropy_coef=0.01, value_coef=0.5, belief_coef=0.25):
-        if not legal_actions:
-            legal_actions = [action]
-        if action not in legal_actions:
-            legal_actions = list(legal_actions) + [action]
-
-        self.model.train()
-        with self._autocast_context():
-            tile_tensor, meta_tensor = self._encode_features(features)
-            outputs = self._forward(tile_tensor, meta_tensor)
-
-            scores = self._legal_action_scores(outputs, legal_actions, features=features)
-            log_probabilities = torch.log_softmax(scores, dim=0)
-            probabilities = torch.softmax(scores, dim=0)
-            action_index = legal_actions.index(action)
-            current_log_prob = log_probabilities[action_index]
-
-            if old_log_prob is None:
-                old_log_prob = float(current_log_prob.item())
-
-            ratio = torch.exp(current_log_prob - torch.tensor(float(old_log_prob), dtype=torch.float32, device=self.device))
-            clipped_ratio = torch.clamp(ratio, 1.0 - float(clip_range), 1.0 + float(clip_range))
-            advantage_tensor = torch.tensor(float(advantage), dtype=torch.float32, device=self.device)
-            surrogate = torch.minimum(ratio * advantage_tensor, clipped_ratio * advantage_tensor)
-            policy_loss = -surrogate
-
-            entropy = -(probabilities * log_probabilities).sum()
-            return_tensor = torch.tensor([[float(return_target)]], dtype=torch.float32, device=self.device)
-            value_loss = F.mse_loss(outputs['value'], return_tensor)
-            belief_target = torch.tensor([self._belief_target_from_features(features)], dtype=torch.float32, device=self.device)
-            belief_loss = F.kl_div(torch.log(torch.clamp(outputs['belief_probs'], min=1e-12)), belief_target, reduction='batchmean')
-
-            loss = policy_loss + float(value_coef) * value_loss - float(entropy_coef) * entropy + float(belief_coef) * belief_loss
-        self.optimizer.zero_grad()
-        if self.amp_enabled:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            self.optimizer.step()
-
-        return {
-            'policy_loss': float(policy_loss.item()),
-            'value_loss': float(value_loss.item()),
-            'belief_loss': float(belief_loss.item()),
-            'entropy': float(entropy.item()),
-            'ratio': float(ratio.item()),
-        }
-
-    def fit(
-        self,
-        records,
-        epochs=1,
-        max_records=None,
-        shuffle=False,
-        verbose=False,
-        policy_weight=1.0,
-        value_weight=0.5,
-        belief_weight=0.25,
-        forced_policy_weight=0.0,
-        aux_value_weight=0.15,
-        efficiency_weight=0.1,
-        belief_consistency_weight=0.1,
-        batch_size=1,
-        show_progress=False,
-    ):
-        stats = {
-            'samples': 0,
-            'action_loss': 0.0,
-            'value_loss': 0.0,
-            'aux_value_loss': 0.0,
-            'belief_loss': 0.0,
-            'belief_consistency_loss': 0.0,
-            'efficiency_bonus': 0.0,
-            'action_hits': 0,
-            'weighted_total_loss': 0.0,
-            'decision_samples': 0,
-            'decision_hits': 0,
-            'forced_samples': 0,
-        }
-        limit = None if max_records is None else int(max_records)
-
-        epoch_count = int(epochs)
-        for epoch_index in range(epoch_count):
-            if verbose:
-                print('starting epoch %d/%d' % (epoch_index + 1, epoch_count))
-
-            epoch_start_samples = stats['samples']
-            epoch_start_action_loss = stats['action_loss']
-            epoch_start_value_loss = stats['value_loss']
-            epoch_start_weighted_total_loss = stats['weighted_total_loss']
-            epoch_start_action_hits = stats['action_hits']
-
-            if shuffle:
-                record_list = list(records)
-                order = torch.randperm(len(record_list), generator=torch.Generator().manual_seed(self.seed + epoch_index)).tolist()
-                iterable = [record_list[index] for index in order]
-            else:
-                iterable = records
-
-            effective_batch_size = max(1, int(batch_size))
-            pending_batch = []
-            epoch_processed = 0
-            epoch_label = 'epoch %d/%d' % (epoch_index + 1, epoch_count)
-            if limit is not None:
-                epoch_total = int(limit)
-            elif hasattr(iterable, '__len__'):
-                epoch_total = int(len(iterable))
-            else:
-                epoch_total = 1
-
-            def _flush_pending_batch(current_batch):
-                if not current_batch:
-                    return
-                if effective_batch_size <= 1:
-                    record = current_batch[0]
-                    legal_actions = list(record.legal_actions or [])
-                    if record.action not in legal_actions:
-                        legal_actions.append(record.action)
-                    is_decision_state = len(legal_actions) > 1
-                    record_policy_weight = float(policy_weight) if is_decision_state else float(forced_policy_weight)
-                    result = self.train_step(
-                        record.features,
-                        legal_actions,
-                        record.action,
-                        record.reward,
-                        policy_weight=record_policy_weight,
-                        value_weight=value_weight,
-                        belief_weight=belief_weight,
-                        aux_value_weight=aux_value_weight,
-                        efficiency_weight=efficiency_weight,
-                        belief_consistency_weight=belief_consistency_weight,
+        for _epoch in range(max(1, int(epochs))):
+            order = np.arange(total)
+            rng.shuffle(order)
+            for start in range(0, total, max(1, int(minibatch_size))):
+                rows = self._to_device(order[start: start + max(1, int(minibatch_size))])
+                with self._autocast():
+                    outputs = self.model(planes[rows], meta[rows])
+                    scores = self._score_actions(
+                        outputs, family[rows], arg1[rows], arg2[rows], mask[rows]
                     )
-                    stats['samples'] += 1
-                    stats['action_loss'] += result['action_loss']
-                    stats['value_loss'] += result['value_loss']
-                    stats['aux_value_loss'] += result.get('aux_value_loss', 0.0)
-                    stats['belief_loss'] += result.get('belief_loss', 0.0)
-                    stats['belief_consistency_loss'] += result.get('belief_consistency_loss', 0.0)
-                    stats['efficiency_bonus'] += result.get('efficiency_bonus', 0.0)
-                    stats['action_hits'] += result['action_hit']
-                    stats['weighted_total_loss'] += result.get('weighted_total_loss', 0.0)
-                    if result.get('is_decision_state'):
-                        stats['decision_samples'] += 1
-                        stats['decision_hits'] += result['action_hit']
-                    else:
-                        stats['forced_samples'] += 1
-                    if show_progress:
-                        _print_progress_bar(epoch_label, epoch_processed, epoch_total)
-                    return
+                    log_probs = torch.log_softmax(scores, dim=1)
+                    probs = torch.softmax(scores, dim=1)
+                    current_log_prob = log_probs.gather(
+                        1, action_index[rows].unsqueeze(1)
+                    ).squeeze(1)
 
-                batch_result = self.train_batch_step(
-                    current_batch,
-                    policy_weight=policy_weight,
-                    value_weight=value_weight,
-                    belief_weight=belief_weight,
-                    forced_policy_weight=forced_policy_weight,
-                    aux_value_weight=aux_value_weight,
-                    efficiency_weight=efficiency_weight,
-                    belief_consistency_weight=belief_consistency_weight,
-                )
-                stats['samples'] += batch_result.get('samples', 0)
-                stats['action_loss'] += batch_result.get('action_loss', 0.0)
-                stats['value_loss'] += batch_result.get('value_loss', 0.0)
-                stats['aux_value_loss'] += batch_result.get('aux_value_loss', 0.0)
-                stats['belief_loss'] += batch_result.get('belief_loss', 0.0)
-                stats['belief_consistency_loss'] += batch_result.get('belief_consistency_loss', 0.0)
-                stats['efficiency_bonus'] += batch_result.get('efficiency_bonus', 0.0)
-                stats['action_hits'] += batch_result.get('action_hits', 0)
-                stats['weighted_total_loss'] += batch_result.get('weighted_total_loss', 0.0)
-                stats['decision_samples'] += batch_result.get('decision_samples', 0)
-                stats['decision_hits'] += batch_result.get('decision_hits', 0)
-                stats['forced_samples'] += batch_result.get('forced_samples', 0)
-                if show_progress:
-                    _print_progress_bar(epoch_label, epoch_processed, epoch_total)
+                    ratio = torch.exp(current_log_prob - old_log_prob[rows])
+                    clipped = torch.clamp(ratio, 1.0 - float(clip_range), 1.0 + float(clip_range))
+                    adv = advantage[rows]
+                    policy_loss = -torch.minimum(ratio * adv, clipped * adv).mean()
 
-            for record in iterable:
-                if limit is not None and (stats['samples'] + len(pending_batch)) >= limit:
-                    if verbose:
-                        print('stopping early at max_records=%d' % limit)
-                    break
-
-                pending_batch.append(record)
-                epoch_processed += 1
-                if len(pending_batch) >= effective_batch_size:
-                    _flush_pending_batch(pending_batch)
-                    pending_batch = []
-
-                if verbose and (epoch_processed == 1 or epoch_processed % 10000 == 0):
-                    print('epoch %d/%d processed_records=%d total_samples=%d' % (epoch_index + 1, epoch_count, epoch_processed, stats['samples']))
-
-            if pending_batch:
-                _flush_pending_batch(pending_batch)
-
-            if show_progress and epoch_processed < epoch_total:
-                _print_progress_bar(epoch_label, epoch_total, epoch_total)
-
-            if verbose and stats['samples'] > 0:
-                epoch_samples = stats['samples'] - epoch_start_samples
-                if epoch_samples <= 0:
-                    print('epoch %d/%d had no records to train on' % (epoch_index + 1, epoch_count))
-                    continue
-                samples = float(epoch_samples)
-                print(
-                    'epoch %d/%d samples=%d action_loss=%.6f value_loss=%.6f weighted_total_loss=%.6f action_accuracy=%.6f'
-                    % (
-                        epoch_index + 1,
-                        epoch_count,
-                        epoch_samples,
-                        (stats['action_loss'] - epoch_start_action_loss) / samples,
-                        (stats['value_loss'] - epoch_start_value_loss) / samples,
-                        (stats['weighted_total_loss'] - epoch_start_weighted_total_loss) / samples,
-                        float(stats['action_hits'] - epoch_start_action_hits) / samples,
+                    # Clamp -inf padded slots: probs are 0 there, and clamping
+                    # (rather than torch.where) keeps their gradients NaN-free.
+                    entropy = -(probs * log_probs.clamp(min=-30.0)).sum(dim=1).mean()
+                    value_loss = F.mse_loss(outputs['value'], return_target[rows])
+                    loss = (
+                        policy_loss
+                        + float(value_coef) * value_loss
+                        - float(entropy_coef) * entropy
                     )
-                )
+
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                self.optimizer.step()
+
+                stats['updates'] += 1
+                stats['policy_loss'] += float(policy_loss.item())
+                stats['value_loss'] += float(value_loss.item())
+                stats['entropy'] += float(entropy.item())
 
         return stats
 
-    def state_dict(self):
-        return {key: tensor.detach().cpu().tolist() for key, tensor in self.model.state_dict().items()}
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
 
-    def torch_state_dict(self):
+    def state_dict(self):
         return {key: tensor.detach().cpu() for key, tensor in self.model.state_dict().items()}
 
     def load_state_dict(self, state_dict):
-        current_state = self.model.state_dict()
-        tensor_state = {}
+        current = self.model.state_dict()
+        if set(state_dict.keys()) != set(current.keys()):
+            missing = sorted(set(current) - set(state_dict))
+            unexpected = sorted(set(state_dict) - set(current))
+            raise ValueError(
+                'Checkpoint keys mismatch. missing=%r unexpected=%r' % (missing, unexpected)
+            )
+        prepared = {}
         for key, value in state_dict.items():
-            if key in current_state:
-                tensor = torch.tensor(value, dtype=torch.float32, device=self.device)
-                if tuple(tensor.shape) == tuple(current_state[key].shape):
-                    tensor_state[key] = tensor
-        current_state.update(tensor_state)
-        self.model.load_state_dict(current_state, strict=False)
-
-    def to_dict(self):
-        return {
-            'model_type': 'cnn_policy_value_v1',
-            'action_space_size': self.action_space_size,
-            'hidden_size': self.hidden_size,
-            'learning_rate': self.learning_rate,
-            'seed': self.seed,
-            'backend': self.backend,
-            'package_profile': self.package_profile,
-            'state_dict': self.state_dict(),
-            'metadata': self.metadata,
-            'device': self.resolved_device,
-        }
-
-    @classmethod
-    def from_dict(cls, payload, device='cpu'):
-        if not isinstance(payload, dict):
-            raise ValueError('Invalid checkpoint payload.')
-        if _safe_int(payload.get('action_space_size', 0), 0) <= 0:
-            raise ValueError('Invalid checkpoint payload: missing action_space_size.')
-        model = cls(
-            action_space_size=payload.get('action_space_size', 0),
-            hidden_size=payload.get('hidden_size', 32),
-            learning_rate=payload.get('learning_rate', 0.001),
-            seed=payload.get('seed', 7),
-            metadata=payload.get('metadata', {}),
-            device=device,
-        )
-        state_payload = payload.get('state_dict') or payload.get('weights')
-        if isinstance(state_payload, dict) and state_payload:
-            try:
-                model.load_state_dict(state_payload)
-            except Exception:
-                pass
-        return model
+            tensor = torch.as_tensor(np.asarray(value), dtype=torch.float32, device=self.device)
+            if tuple(tensor.shape) != tuple(current[key].shape):
+                raise ValueError(
+                    'Checkpoint shape mismatch for %s: %r vs %r'
+                    % (key, tuple(tensor.shape), tuple(current[key].shape))
+                )
+            prepared[key] = tensor
+        self.model.load_state_dict(prepared, strict=True)
 
     def save(self, path):
         parent = os.path.dirname(path)
         if parent and not os.path.exists(parent):
             os.makedirs(parent)
+        self.metadata['feature_schema_version'] = FEATURE_SCHEMA_VERSION
         with h5py.File(path, 'w') as handle:
-            handle.attrs['model_type'] = self.to_dict()['model_type']
-            handle.attrs['action_space_size'] = self.action_space_size
+            handle.attrs['model_type'] = MODEL_TYPE
+            handle.attrs['channels'] = self.channels
+            handle.attrs['blocks'] = self.blocks
             handle.attrs['hidden_size'] = self.hidden_size
             handle.attrs['learning_rate'] = self.learning_rate
             handle.attrs['seed'] = self.seed
-            handle.attrs['backend'] = self.backend
-            handle.attrs['package_profile'] = json.dumps(self.package_profile, sort_keys=True)
+            handle.attrs['plane_count'] = PLANE_COUNT
+            handle.attrs['meta_count'] = META_COUNT
+            handle.attrs['feature_schema_version'] = FEATURE_SCHEMA_VERSION
             handle.attrs['metadata'] = json.dumps(self.metadata, sort_keys=True)
-
-            state_group = handle.create_group('state_dict')
-            for key, tensor in self.torch_state_dict().items():
-                state_group.create_dataset(key, data=tensor.numpy())
+            group = handle.create_group('state_dict')
+            for key, tensor in self.state_dict().items():
+                group.create_dataset(key, data=tensor.numpy())
 
     @classmethod
     def load(cls, path, device='cpu'):
-        with open(path, 'rb') as handle:
-            header = handle.read(8)
+        if not os.path.exists(path):
+            raise FileNotFoundError('Model checkpoint not found: %s' % path)
+        with h5py.File(path, 'r') as handle:
+            model_type = handle.attrs.get('model_type')
+            if model_type != MODEL_TYPE:
+                raise ValueError(
+                    'Unsupported checkpoint type %r (expected %r). '
+                    'Retrain the model with the current pipeline.' % (model_type, MODEL_TYPE)
+                )
+            schema = int(handle.attrs.get('feature_schema_version', -1))
+            if schema != FEATURE_SCHEMA_VERSION:
+                raise ValueError(
+                    'Checkpoint feature schema v%d does not match current v%d. '
+                    'Retrain the model.' % (schema, FEATURE_SCHEMA_VERSION)
+                )
+            if int(handle.attrs.get('plane_count', -1)) != PLANE_COUNT or int(
+                handle.attrs.get('meta_count', -1)
+            ) != META_COUNT:
+                raise ValueError('Checkpoint input contract does not match features module.')
 
-        if header == b'\x89HDF\r\n\x1a\n':
-            with h5py.File(path, 'r') as handle:
-                state_dict = {}
-                if 'state_dict' in handle:
-                    state_group = cast(Any, handle['state_dict'])
-                    for key in state_group.keys():
-                        state_dict[key] = np.asarray(state_group[key][()]).tolist()
-                payload = {
-                    'action_space_size': int(handle.attrs.get('action_space_size', 0)),
-                    'hidden_size': int(handle.attrs.get('hidden_size', 32)),
-                    'learning_rate': float(handle.attrs.get('learning_rate', 0.001)),
-                    'seed': int(handle.attrs.get('seed', 7)),
-                    'backend': handle.attrs.get('backend', 'torch'),
-                    'package_profile': json.loads(handle.attrs.get('package_profile', '{}')),
-                    'state_dict': state_dict,
-                    'metadata': json.loads(handle.attrs.get('metadata', '{}')),
-                }
-            return cls.from_dict(payload, device=device)
-
-        with open(path, 'r', encoding='utf-8') as handle:
-            payload = json.load(handle)
-        return cls.from_dict(payload, device=device)
+            model = cls(
+                channels=int(handle.attrs['channels']),
+                blocks=int(handle.attrs['blocks']),
+                hidden_size=int(handle.attrs['hidden_size']),
+                learning_rate=float(handle.attrs.get('learning_rate', 0.001)),
+                seed=int(handle.attrs.get('seed', 7)),
+                metadata=json.loads(handle.attrs.get('metadata', '{}')),
+                device=device,
+            )
+            state = {key: np.asarray(handle['state_dict'][key][()]) for key in handle['state_dict']}
+        model.load_state_dict(state)
+        return model
