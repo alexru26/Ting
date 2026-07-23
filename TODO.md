@@ -31,6 +31,9 @@
 - Remove unnecessary passes, re-reads, and duplicated tensor work.
 - Preserve the strongest learning signal while keeping training fast and memory-efficient.
 
+8. Consider multiple models.
+- Consider the possibility of using different models for different actions (DISCARD, CHII, PENG, GANG, etc.)
+
 ## Additional Context
 - The relevant src files will be bundled into a zip for Botzone. That is the ultimate point of the project.
 - This TODO are all the things that are worth thinking a lot about. There may be more things that come up that are worth addressing. If so, do so. This TODO only serves as a rough outline for what I am thinking about right now.
