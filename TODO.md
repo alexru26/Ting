@@ -39,3 +39,4 @@
 - This TODO are all the things that are worth thinking a lot about. There may be more things that come up that are worth addressing. If so, do so. This TODO only serves as a rough outline for what I am thinking about right now.
 - To ensure rigor in this project, use plenty of tests. Also manually verify that things look right in terminal in addition to the unit tests. 
 - The final model will be trained on a pod via RunPod, so there are not any major resource constraints. 
+- Make sure to make all your changes in a new branch called "rework".
