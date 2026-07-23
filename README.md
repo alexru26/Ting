@@ -74,7 +74,7 @@ simulates full 4-player rounds with the rule-based teacher in
 final score delta (scaled by 1/64) so the value head has a real target:
 
 ```bash
-python src/local_game.py --games 1000 --seed 1 --export-dataset data/DATA.jsonl
+python src/local_game.py --games 1000 --seed 1 --export-dataset data/local_data.jsonl
 ```
 
 ### 2. Supervised training
@@ -84,7 +84,7 @@ is built automatically (one streaming pass, quantized uint8 planes) when
 missing or stale:
 
 ```bash
-python src/imitation.py train-cnn --dataset data/DATA.jsonl --out src/model.h5 \
+python src/imitation.py train-cnn --dataset data/local_data.jsonl --out src/model.h5 \
     --epochs 20 --channels 64 --blocks 6 --hidden-size 512 --batch-size 1024 \
     --device auto --verbose
 ```
@@ -95,7 +95,7 @@ zero policy loss automatically (their legal softmax is a point mass), so no
 decision-only filtering is needed. Evaluate with:
 
 ```bash
-python src/imitation.py eval-cnn --dataset data/DATA.jsonl --model src/model.h5
+python src/imitation.py eval-cnn --dataset data/local_data.jsonl --model src/model.h5
 ```
 
 ### 3. Reinforcement learning and self-play

@@ -4,8 +4,7 @@ __pycache__
 .DS_Store
 data/*.jsonl
 data/*.npz
-.github/agents
-.github/copilot-instructions.md
+.github
 botzone
 ai
 runpod
