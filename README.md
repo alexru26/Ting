@@ -1,12 +1,10 @@
 # Ting Mahjong Agent
 
-A neural Chinese Standard Mahjong bot for [Botzone](https://botzone.org.cn). The
-runtime files under [src/](src/) are bundled into a zip for Botzone; the neural
-model is the only runtime decision source (there is no rule-based fallback).
+A neural Chinese Standard Mahjong bot.
 
 ## Runtime Decision Flow
 
-1. [src/bot.py](src/bot.py) reads the Botzone JSON payload and rebuilds
+1. [src/bot.py](src/bot.py) reads the JSON payload and rebuilds
    [src/state.py](src/state.py) `GameState` from the full request/response history.
 2. `GameState.enumerate_legal_actions()` enumerates exactly the moves the judge
    will accept: HU only when the hand actually wins (>= 8 fan), meld discards
@@ -60,8 +58,7 @@ per decision and duplicated what the value head should learn.
   softmax over the legal actions only. Training uses this same masked scoring,
   so the training objective matches the runtime decision rule exactly.
 - One shared trunk with per-family conditioned heads gives per-action-family
-  specialisation while keeping a single checkpoint, which the Botzone bundle
-  requires.
+  specialisation while keeping a single checkpoint.
 
 Checkpoints are HDF5 files with the architecture and feature contract stored
 as attributes; loading verifies both strictly and raises on any mismatch.
@@ -126,7 +123,7 @@ Run a single game and print the final state:
 python src/local_game.py --games 1 --seed 42
 ```
 
-Pipe a Botzone-style payload through the bot:
+Pipe a JSON payload through the bot:
 
 ```bash
 echo '{"requests": ["0 0 0", "1 0 0 0 0 W1 W2 W3 B4 B5 B6 T7 T8 T9 J1 J1 F1 F2", "2 W4"], "responses": ["PASS", "PASS"]}' | python src/bot.py
@@ -137,14 +134,3 @@ Run the full test suite:
 ```bash
 python -m unittest -q
 ```
-
-## Botzone Bundle
-
-Zip the runtime files (entry point `__main__.py`) plus the checkpoint:
-
-```
-src/__main__.py src/bot.py src/policy.py src/state.py src/features.py
-src/model.py src/scoring.py src/tiles.py src/dataset.py src/model.h5
-```
-
-(`dataset.py` is not needed at runtime and may be omitted; everything else is.)
