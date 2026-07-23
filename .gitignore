@@ -1,6 +1,9 @@
 .vscode
 .venv
 __pycache__
+.DS_Store
+data/*.jsonl
+data/*.npz
 .github/agents
 .github/copilot-instructions.md
 botzone
