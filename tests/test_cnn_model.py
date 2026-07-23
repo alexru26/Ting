@@ -2,213 +2,180 @@ import os
 import sys
 import tempfile
 import unittest
-
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 
-from action_codec import ActionCodec
-from dataset import JsonlTrajectoryWriter, TrajectoryRecord
-from imitation import choose_action_from_model, evaluate_cnn, load_policy_model, train_cnn
-from ml_packages import package_profile
-from model import CnnPolicyValueModel, resolve_device
+import numpy as np
+import torch
+
+from features import FeatureExtractor
+from model import CnnPolicyValueModel, encode_action, FAMILY_LABELS, NONE_TOKEN
+from state import GameState
 
 
-def _feature_bundle(marker):
-    hand = [0] * 34
-    seen = [0] * 34
-    discard = [0] * 34
-    pack = [0] * 34
-    opponent_one = [0] * 34
-    opponent_two = [0] * 34
-    opponent_three = [0] * 34
+def _tiny_model():
+    return CnnPolicyValueModel(channels=8, blocks=1, hidden_size=32, seed=3)
 
-    hand[marker] = 1
-    seen[(marker + 1) % 34] = 1
-    discard[(marker + 2) % 34] = 1
-    pack[(marker + 3) % 34] = 1
-    opponent_one[(marker + 4) % 34] = 1
-    opponent_two[(marker + 5) % 34] = 1
-    opponent_three[(marker + 6) % 34] = 1
 
+def _sample_state():
+    state = GameState()
+    state.my_id = 0
+    state.hand = ['W1', 'W1', 'W2', 'W3', 'B4', 'B5', 'B6', 'T7', 'T8', 'T9', 'J1', 'J1', 'F1', 'F2']
+    state.opponent_discards = {1: [], 2: [], 3: []}
+    state.opponent_packs = {1: [], 2: [], 3: []}
+    state.last_request_type = 2
+    state.last_tile = 'F2'
+    state.last_actor = 0
+    return state
+
+
+def _sample_features_and_actions():
+    state = _sample_state()
+    return FeatureExtractor().extract(state), state.enumerate_legal_actions()
+
+
+def _build_preencoded(features, legal_actions, target_action, count=16, reward=0.25):
+    model = _tiny_model()
+    planes, meta = model.encode_features_batch([features] * count)
+    family, arg1, arg2, mask = model.encode_legal_actions([list(legal_actions)] * count)
     return {
-        'hand_counts': hand,
-        'seen_counts': seen,
-        'self_discard_counts': discard,
-        'pack_counts': pack,
-        'opponent_discard_counts': [opponent_one, opponent_two, opponent_three],
-        'meta': [marker, 0, 0, 0, 2, 0, 1, 0],
-        'request_type': 2,
-        'seat': 0,
-        'target_player': True,
+        'tile_planes_q': np.round(planes * 4.0).astype(np.uint8),
+        'meta': meta,
+        'legal_family': family.astype(np.uint8),
+        'legal_arg1': arg1.astype(np.uint8),
+        'legal_arg2': arg2.astype(np.uint8),
+        'legal_len': mask.sum(axis=1).astype(np.int16),
+        'target_index': np.full((count,), legal_actions.index(target_action), dtype=np.int16),
+        'reward': np.full((count,), float(reward), dtype=np.float32),
     }
 
 
-class TestCnnModel(unittest.TestCase):
-    def test_resolve_device_auto_falls_back_or_uses_cuda(self):
-        resolved, requested, resolved_name = resolve_device('auto')
-        self.assertIn(requested, ['auto'])
-        self.assertIn(resolved_name, ['cpu', 'cuda'])
-        self.assertEqual(str(resolved), resolved_name)
+class TestActionEncoding(unittest.TestCase):
 
-    def test_train_cnn_records_requested_and_resolved_device(self):
+    def test_encode_action_families(self):
+        for label in FAMILY_LABELS:
+            family, _arg1, _arg2 = encode_action(label if label != 'CHI' else 'CHI W2 W4')
+            self.assertEqual(family, FAMILY_LABELS.index(label))
+
+    def test_encode_action_arguments(self):
+        family, arg1, arg2 = encode_action('CHI W2 B9')
+        self.assertEqual(FAMILY_LABELS[family], 'CHI')
+        self.assertNotEqual(arg1, arg2)
+        _family, none1, none2 = encode_action('PASS')
+        self.assertEqual(none1, none2)
+
+    def test_encode_action_rejects_unknown_family(self):
+        with self.assertRaises(ValueError):
+            encode_action('JUMP W1')
+
+
+class TestInference(unittest.TestCase):
+
+    def test_choose_action_is_legal_and_deterministic(self):
+        features, legal_actions = _sample_features_and_actions()
+        model = _tiny_model()
+        first = model.choose_action_from_features(features, legal_actions)
+        second = model.choose_action_from_features(features, legal_actions)
+        self.assertIn(first, legal_actions)
+        self.assertEqual(first, second)
+
+    def test_policy_info_probabilities_sum_to_one(self):
+        features, legal_actions = _sample_features_and_actions()
+        model = _tiny_model()
+        info = model.policy_info_from_features(features, legal_actions)
+        self.assertAlmostEqual(sum(info['probabilities']), 1.0, places=4)
+        self.assertEqual(len(info['actions']), len(legal_actions))
+
+    def test_rejects_wrong_schema_features(self):
+        model = _tiny_model()
+        with self.assertRaises(ValueError):
+            model.policy_info_from_features({'schema_version': 3}, ['PASS'])
+
+    def test_rejects_empty_legal_actions(self):
+        features, _legal = _sample_features_and_actions()
+        model = _tiny_model()
+        with self.assertRaises(ValueError):
+            model.policy_info_from_features(features, [])
+
+
+class TestTraining(unittest.TestCase):
+
+    def test_supervised_training_learns_target(self):
+        features, legal_actions = _sample_features_and_actions()
+        target = legal_actions[2]
+        preencoded = _build_preencoded(features, legal_actions, target, count=8)
+        model = _tiny_model()
+        for _ in range(30):
+            model.fit_preencoded(preencoded, epochs=1, batch_size=8, shuffle=False)
+        chosen = model.choose_action_from_features(features, legal_actions)
+        self.assertEqual(chosen, target)
+
+    def test_evaluate_preencoded_reports_metrics(self):
+        features, legal_actions = _sample_features_and_actions()
+        preencoded = _build_preencoded(features, legal_actions, legal_actions[0], count=8)
+        model = _tiny_model()
+        metrics = model.evaluate_preencoded(preencoded, top_ks=(1, 3))
+        self.assertEqual(metrics['evaluated'], 8)
+        self.assertEqual(metrics['decision_evaluated'], 8)
+        self.assertIn('1', metrics['topk_accuracy'])
+        self.assertGreaterEqual(metrics['masked_cross_entropy'], 0.0)
+
+    def test_ppo_update_keeps_parameters_finite(self):
+        features, legal_actions = _sample_features_and_actions()
+        model = _tiny_model()
+        info = model.policy_info_from_features(features, legal_actions)
+        transitions = [
+            {
+                'features': features,
+                'legal_actions': legal_actions,
+                'action': legal_actions[idx % len(legal_actions)],
+                'old_log_prob': info['log_probabilities'][idx % len(legal_actions)],
+                'advantage': 0.5 if idx % 2 == 0 else -0.5,
+                'return_target': 0.1,
+            }
+            for idx in range(6)
+        ]
+        stats = model.ppo_update(transitions, epochs=2, minibatch_size=3)
+        self.assertGreater(stats['updates'], 0)
+        for tensor in model.model.state_dict().values():
+            self.assertTrue(bool(torch.isfinite(tensor).all()))
+
+
+class TestPersistence(unittest.TestCase):
+
+    def test_save_load_roundtrip(self):
+        features, legal_actions = _sample_features_and_actions()
+        model = _tiny_model()
+        expected = model.choose_action_from_features(features, legal_actions)
         with tempfile.TemporaryDirectory() as tmp:
-            dataset_path = os.path.join(tmp, 'train.jsonl')
-            model_path = os.path.join(tmp, 'model.h5')
-            self._write_dataset(dataset_path)
+            path = os.path.join(tmp, 'model.h5')
+            model.save(path)
+            loaded = CnnPolicyValueModel.load(path)
+        self.assertEqual(loaded.channels, model.channels)
+        self.assertEqual(loaded.choose_action_from_features(features, legal_actions), expected)
 
-            result = train_cnn(
-                dataset_path=dataset_path,
-                model_out_path=model_path,
-                epochs=1,
-                hidden_size=8,
-                learning_rate=0.01,
-                device='auto',
-            )
+    def test_load_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            CnnPolicyValueModel.load('/nonexistent/model.h5')
 
-            metadata = result.get('metadata', {})
-            self.assertEqual(metadata.get('requested_device'), 'auto')
-            self.assertIn(metadata.get('resolved_device'), ['cpu', 'cuda'])
-
-    def _write_dataset(self, path):
-        with JsonlTrajectoryWriter(path) as writer:
-            writer.write(
-                TrajectoryRecord(
-                    game_id='g1',
-                    turn_index=0,
-                    player_id=0,
-                    request_type=2,
-                    request_action='DRAW',
-                    action='PLAY W1',
-                    legal_actions=['PASS', 'PLAY W1', 'PLAY W2'],
-                    features=_feature_bundle(0),
-                )
-            )
-            writer.write(
-                TrajectoryRecord(
-                    game_id='g2',
-                    turn_index=0,
-                    player_id=0,
-                    request_type=2,
-                    request_action='DRAW',
-                    action='PLAY W2',
-                    legal_actions=['PASS', 'PLAY W1', 'PLAY W2'],
-                    features=_feature_bundle(1),
-                )
-            )
-            writer.write(
-                TrajectoryRecord(
-                    game_id='g3',
-                    turn_index=0,
-                    player_id=0,
-                    request_type=3,
-                    request_action='PLAY',
-                    action='PASS',
-                    legal_actions=['PASS', 'HU'],
-                    features=_feature_bundle(2),
-                )
-            )
-
-    def test_train_eval_and_load_cnn(self):
-        codec = ActionCodec()
+    def test_load_rejects_wrong_model_type(self):
+        import h5py
         with tempfile.TemporaryDirectory() as tmp:
-            dataset_path = os.path.join(tmp, 'train.jsonl')
-            model_path = os.path.join(tmp, 'model.json')
-            self._write_dataset(dataset_path)
+            path = os.path.join(tmp, 'legacy.h5')
+            with h5py.File(path, 'w') as handle:
+                handle.attrs['model_type'] = 'cnn_policy_value_v1'
+            with self.assertRaises(ValueError):
+                CnnPolicyValueModel.load(path)
 
-            train_result = train_cnn(
-                dataset_path=dataset_path,
-                model_out_path=model_path,
-                epochs=10,
-                learning_rate=0.05,
-                hidden_size=16,
-            )
-            self.assertEqual(train_result['model_type'], 'cnn_policy_value_v1')
-            self.assertEqual(train_result['backend'], 'torch')
-            self.assertEqual(train_result['package_profile']['preferred_numeric_backend'], 'torch')
-            self.assertTrue(os.path.exists(model_path))
-
-            metrics = evaluate_cnn(dataset_path, model_path, top_ks=[1, 3])
-            self.assertEqual(metrics['total_evaluated'], 3)
-            self.assertGreaterEqual(metrics['topk_accuracy']['1'], 2.0 / 3.0)
-            self.assertGreaterEqual(metrics['masked_cross_entropy'], 0.0)
-            self.assertGreaterEqual(metrics['nll'], 0.0)
-            self.assertGreaterEqual(metrics['value_mse'], 0.0)
-            self.assertGreaterEqual(metrics['ece'], 0.0)
-            self.assertGreaterEqual(metrics['brier'], 0.0)
-
-            model = load_policy_model(model_path)
-            action = choose_action_from_model(
-                model=model,
-                features=_feature_bundle(0),
-                legal_actions=['PASS', 'PLAY W1'],
-                codec=codec,
-            )
-            self.assertIn(action, ['PASS', 'PLAY W1'])
-
-    def test_belief_outputs_and_ablation_controls(self):
-        codec = ActionCodec()
-        model = CnnPolicyValueModel(
-            action_space_size=codec.size,
-            hidden_size=16,
-            learning_rate=0.05,
-        )
-        features = _feature_bundle(3)
-
-        info = model.policy_info_from_features(features, ['PASS', 'PLAY W1'])
-        self.assertIn('belief_probs', info)
-        self.assertIn('belief_entropy', info)
-        self.assertEqual(len(info['belief_probs']), 34)
-        self.assertGreaterEqual(info['belief_entropy'], 0.0)
-
-        shaped = model.train_step(features, ['PASS', 'PLAY W1'], 'PLAY W1', 1.0)
-        self.assertIn('belief_loss', shaped)
-        self.assertGreaterEqual(shaped['belief_loss'], 0.0)
-        self.assertIn('aux_value_loss', shaped)
-        self.assertGreaterEqual(shaped['aux_value_loss'], 0.0)
-        self.assertIn('belief_consistency_loss', shaped)
-        self.assertGreaterEqual(shaped['belief_consistency_loss'], 0.0)
-        self.assertIn('weighted_total_loss', shaped)
-        self.assertGreaterEqual(shaped['weighted_total_loss'], 0.0)
-
-        base_action = model.choose_action_from_features(features, ['PASS', 'PLAY W1'], belief_weight=0.0)
-        belief_action = model.choose_action_from_features(features, ['PASS', 'PLAY W1'], belief_weight=3.0)
-        self.assertIn(base_action, ['PASS', 'PLAY W1'])
-        self.assertIn(belief_action, ['PASS', 'PLAY W1'])
-
-    def test_conditioned_decode_and_legal_masking(self):
-        codec = ActionCodec()
-        model = CnnPolicyValueModel(
-            action_space_size=codec.size,
-            hidden_size=16,
-            learning_rate=0.05,
-        )
-        features = _feature_bundle(6)
-        legal_actions = ['PASS', 'PLAY W1']
-
-        chosen = model.decode_conditioned_action_from_features(features, legal_actions=legal_actions, deterministic=True)
-        self.assertIn(chosen, legal_actions)
-
-        distribution = model.action_distribution_from_features(features, legal_actions)
-        self.assertEqual(set(distribution.keys()), set(legal_actions))
-        self.assertAlmostEqual(sum(distribution.values()), 1.0, places=5)
-
-    def test_backward_compatible_load_without_belief_keys(self):
-        codec = ActionCodec()
-        model = CnnPolicyValueModel(
-            action_space_size=codec.size,
-            hidden_size=16,
-            learning_rate=0.05,
-        )
-        stripped = {key: value for key, value in model.state_dict().items() if 'belief' not in key}
-        restored = CnnPolicyValueModel(
-            action_space_size=codec.size,
-            hidden_size=16,
-            learning_rate=0.05,
-        )
-        restored.load_state_dict(stripped)
-        info = restored.policy_info_from_features(_feature_bundle(4), ['PASS', 'PLAY W1'])
-        self.assertIn('belief_probs', info)
+    def test_load_state_dict_rejects_shape_mismatch(self):
+        model = _tiny_model()
+        state = model.state_dict()
+        key = next(iter(state))
+        state[key] = np.zeros((1, 1), dtype=np.float32)
+        other = _tiny_model()
+        with self.assertRaises(ValueError):
+            other.load_state_dict(state)
 
 
 if __name__ == '__main__':

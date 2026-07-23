@@ -216,14 +216,18 @@ def best_discard(tiles, n_melded=0):
 
 
 def useful_tiles(tiles, n_melded=0):
-    """Tiles that, if drawn and optimally discarded, reduce shanten."""
+    """Tiles that, if drawn, reduce shanten.
+
+    A 3n+2-tile hand's min_shanten equals the best over all discards of the
+    3n+1-tile shanten, so one shanten call per candidate suffices.
+    """
     current = min_shanten(tiles, n_melded)
     result = set()
 
     for candidate in ALL_TILES:
-        extended = tiles + [candidate]
-        _, new_sh = best_discard(extended, n_melded)
-        if new_sh < current:
+        if tiles.count(candidate) >= 4:
+            continue
+        if min_shanten(tiles + [candidate], n_melded) < current:
             result.add(candidate)
 
     return result

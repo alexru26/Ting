@@ -1,29 +1,34 @@
 """
-local_game.py  Python game simulator for local testing.
+local_game.py  Python game simulator for local testing and dataset export.
 
-Runs a complete 4-player Chinese Standard Mahjong round using the bot
-policy directly (no subprocess / JSON I/O), so you can iterate quickly.
+Runs a complete 4-player Chinese Standard Mahjong round using a policy
+directly (no subprocess / JSON I/O), so you can iterate quickly.
 
 Usage
 -----
-    python local_game.py              # run one game, print scores
-    python local_game.py --games 100  # run N games and print win statistics
+    python local_game.py                                # one game, print scores
+    python local_game.py --games 100                    # N games + win statistics
+    python local_game.py --games 500 --export-dataset data/DATA.jsonl
 """
 import argparse
-import json
-import os
 import random
 import time
 import uuid
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple, cast
+
 from dataset import JsonlTrajectoryWriter, TrajectoryRecord
 from features import FeatureExtractor
-from scoring import calculate_fan
+from scoring import can_win, calculate_fan
 from state import GameState
-from policy import GoalBasedPolicy, create_policy
+from rule_policy import GoalBasedPolicy
 from tiles import ALL_TILES, normalize_tiles
+
 FLOWER_TILES = [f'H{i}' for i in range(1, 9)]
+
+# Rewards stored in exported trajectories are final score deltas scaled to a
+# roughly [-1, 1] range for the value head.
+REWARD_SCALE = 64.0
+
 
 def _format_discards(discards, line_width=12):
     if not discards:
@@ -32,6 +37,7 @@ def _format_discards(discards, line_width=12):
     for i in range(0, len(discards), line_width):
         lines.append(' '.join(discards[i:i + line_width]))
     return '\n'.join(lines)
+
 
 def _format_packs(packs):
     if not packs:
@@ -46,15 +52,14 @@ def _format_progress_line(completed, total, bar_width=28):
     bar = '#' * filled + '-' * (bar_width - filled)
     return f'\rDataset progress [{bar}] {done_games}/{total_games} games completed'
 
+
 def render_tui_board(state, game_index, total_games, clear_screen=True):
-    typed_state = cast(Dict[str, Any], state)
     if clear_screen:
         print('\x1b[2J\x1b[H', end='')
     print('=' * 78)
-    print(f"Local Mahjong TUI  game={game_index}/{total_games}  phase={typed_state['phase']}  wall_remaining={typed_state['wall_remaining']}")
+    print(f"Local Mahjong TUI  game={game_index}/{total_games}  phase={state['phase']}  wall_remaining={state['wall_remaining']}")
     print('=' * 78)
-    players = cast(List[Dict[str, Any]], typed_state['players'])
-    for player_state in players:
+    for player_state in state['players']:
         pid = player_state['pid']
         hand = ' '.join(player_state['hand']) if player_state['hand'] else '-'
         flowers = ' '.join(player_state['flowers']) if player_state['flowers'] else '-'
@@ -66,6 +71,7 @@ def render_tui_board(state, game_index, total_games, clear_screen=True):
         print(f"   | discards({len(player_state['discards'])}): {discards}")
         print('-' * 78)
 
+
 def _build_wall():
     """144-tile wall: 4 copies of each of 34 tiles + 8 flower tiles."""
     wall = []
@@ -75,59 +81,6 @@ def _build_wall():
     random.shuffle(wall)
     return wall
 
-
-def _load_opponent_registry(registry_path):
-    if not registry_path:
-        return []
-    if not os.path.exists(registry_path):
-        return []
-
-    with open(registry_path, 'r', encoding='utf-8') as handle:
-        payload = json.load(handle)
-
-    rows = payload.get('opponents', []) if isinstance(payload, dict) else []
-    result = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        result.append(
-            {
-                'id': row.get('id') or row.get('file_name') or 'external-opponent',
-                'kind': 'external',
-                'path': row.get('path') or row.get('file_name'),
-                'policy_mode': row.get('policy_mode', 'imitation'),
-            }
-        )
-    return result
-
-
-def _sample_opponent_rows(pool, seat_count, rng):
-    seat_count = max(0, int(seat_count))
-    rows = list(pool or [])
-    if not rows:
-        rows = [{'id': 'baseline-rule', 'kind': 'baseline', 'policy_mode': 'rule', 'path': None}]
-
-    selected = []
-    for _ in range(seat_count):
-        selected.append(rng.choice(rows))
-    return selected
-
-
-def _build_policy_factory(opponent_rows, candidate_seat=None):
-    seat_rows = {seat: row for seat, row in enumerate(opponent_rows)}
-
-    def policy_factory(state):
-        row = seat_rows.get(state.my_id)
-        if row is None:
-            return GoalBasedPolicy(state)
-        if candidate_seat is not None and state.my_id == int(candidate_seat):
-            return GoalBasedPolicy(state)
-        policy_mode = str(row.get('policy_mode', 'rule')).strip().lower()
-        if policy_mode == 'rule' or row.get('kind') == 'baseline':
-            return GoalBasedPolicy(state)
-        return create_policy(state, mode=policy_mode, model_path=row.get('path'))
-
-    return policy_factory
 
 class _Player:
 
@@ -150,8 +103,28 @@ class _Player:
             if p.pid != self.pid:
                 gs.opponent_discards[p.pid] = p.discards[:]
                 gs.opponent_packs[p.pid] = p.packs[:]
-                for tile in p.discards + [t for _, t, _ in p.packs]:
+                for tile in p.discards:
                     gs.seen_tiles[tile] += 1
+                for ptype, ptile, _ in p.packs:
+                    if ptype == 'PENG':
+                        gs.seen_tiles[ptile] += 3
+                    elif ptype == 'GANG':
+                        gs.seen_tiles[ptile] += 4
+                    elif ptype == 'CHI':
+                        mid_val = int(ptile[1:])
+                        for value in (mid_val - 1, mid_val, mid_val + 1):
+                            gs.seen_tiles[f'{ptile[0]}{value}'] += 1
+        for tile in self.discards:
+            gs.seen_tiles[tile] += 1
+        for ptype, ptile, _ in self.packs:
+            if ptype == 'PENG':
+                gs.seen_tiles[ptile] += 3
+            elif ptype == 'GANG':
+                gs.seen_tiles[ptile] += 4
+            elif ptype == 'CHI':
+                mid_val = int(ptile[1:])
+                for value in (mid_val - 1, mid_val, mid_val + 1):
+                    gs.seen_tiles[f'{ptile[0]}{value}'] += 1
         gs.last_request_type = request_type
         gs.last_tile = last_tile
         gs.last_actor = last_actor
@@ -173,6 +146,7 @@ class _Player:
             else:
                 result.append(('CHI', ptile, poffer))
         return tuple(result)
+
 
 class Game:
     """
@@ -199,6 +173,7 @@ class Game:
         self.feature_extractor = FeatureExtractor()
         self.game_id = game_id or str(uuid.uuid4())
         self._decision_index = 0
+        self._pending_records = []
         self.policy_factory = policy_factory
 
     def run(self):
@@ -211,6 +186,7 @@ class Game:
             self._take_turn(pid)
             if not self._done:
                 turn += 1
+        self._flush_trajectories()
         return {'winner': self._winner, 'fan': self._win_fan, 'self_drawn': self._is_self_drawn, 'scores': self.scores, 'turn_logs': self.turn_logs}
 
     def _record_state(self, phase):
@@ -229,12 +205,44 @@ class Game:
     def _emit_trajectory(self, pid, gs, action, decision_info=None):
         if self.dataset_writer is None:
             return
+        legal_actions = gs.enumerate_legal_actions()
+        if action not in legal_actions:
+            raise ValueError(
+                'Policy produced illegal action %r for player %d (legal: %r)'
+                % (action, pid, legal_actions)
+            )
         metadata = {}
         if decision_info is not None:
             metadata['decision_info'] = decision_info
-        record = TrajectoryRecord(game_id=self.game_id, turn_index=self._decision_index, player_id=pid, request_type=gs.last_request_type, request_action=gs.last_request_action, action=action, legal_actions=gs.enumerate_legal_actions(), reward=0.0, done=False, features=self.feature_extractor.extract(gs), metadata=metadata)
-        self.dataset_writer.write(record)
+        record = TrajectoryRecord(
+            game_id=self.game_id,
+            turn_index=self._decision_index,
+            player_id=pid,
+            request_type=gs.last_request_type,
+            request_action=gs.last_request_action,
+            action=action,
+            legal_actions=legal_actions,
+            reward=0.0,
+            done=False,
+            features=self.feature_extractor.extract(gs),
+            metadata=metadata,
+        )
+        self._pending_records.append(record)
         self._decision_index += 1
+
+    def _flush_trajectories(self):
+        """Backfill final rewards into buffered records, then write them."""
+        if self.dataset_writer is None:
+            return
+        last_record_by_player = {}
+        for record in self._pending_records:
+            record.reward = float(self.scores[record.player_id]) / REWARD_SCALE
+            last_record_by_player[record.player_id] = record
+        for record in last_record_by_player.values():
+            record.done = True
+        for record in self._pending_records:
+            self.dataset_writer.write(record)
+        self._pending_records = []
 
     def _deal(self):
         for p in self.players:
@@ -427,12 +435,16 @@ class Game:
         hand = p.hand[:]
         if is_self_drawn and win_tile in hand:
             hand.remove(win_tile)
-        fc_packs = p.fan_calc_packs(pid)
-        try:
-            fan = calculate_fan(fc_packs, tuple(hand), win_tile, len(p.flowers), is_self_drawn, False, is_about_kong, False, pid % 4, self.quan)
-        except Exception:
-            return False
-        return fan >= self.MIN_FAN
+        return can_win(
+            hand,
+            p.fan_calc_packs(pid),
+            win_tile,
+            len(p.flowers),
+            is_self_drawn,
+            pid % 4,
+            self.quan,
+            is_about_kong=is_about_kong,
+        )
 
     def _resolve_win(self, pid, win_tile, is_self_drawn, from_player=None):
         self._done = True
@@ -442,36 +454,32 @@ class Game:
         hand = p.hand[:]
         if is_self_drawn and win_tile in hand:
             hand.remove(win_tile)
-        fc_packs = p.fan_calc_packs(pid)
-        fan = calculate_fan(fc_packs, tuple(hand), win_tile, len(p.flowers), is_self_drawn, False, False, False, pid % 4, self.quan)
+        fan = calculate_fan(p.fan_calc_packs(pid), tuple(hand), win_tile, len(p.flowers), is_self_drawn, False, False, False, pid % 4, self.quan)
         self._win_fan = fan
-        base = 8 + fan
+        # Botzone Chinese Standard scoring:
+        # self-drawn: winner +3*(8+fan), each loser -(8+fan)
+        # off a discard: winner +(3*8+fan), discarder -(8+fan), others -8
         if is_self_drawn:
             for other in range(4):
                 if other != pid:
-                    self.scores[other] -= base
-                    self.scores[pid] += base
+                    self.scores[other] -= 8 + fan
+            self.scores[pid] += 3 * (8 + fan)
         else:
             payer = from_player if from_player is not None else (pid + 3) % 4
-            self.scores[payer] -= 8 + fan
-            self.scores[pid] += (8 + fan) * 3 - (8 + fan) * 2
-            self.scores[pid] = 3 * base - 2 * base
-            for i in range(4):
-                self.scores[i] = 0
-            self.scores[pid] = 3 * base
+            self.scores[pid] += 3 * 8 + fan
             for other in range(4):
                 if other == payer:
                     self.scores[other] -= 8 + fan
                 elif other != pid:
                     self.scores[other] -= 8
 
-def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.05, no_clear=False, export_dataset_path=None, opponent_registry_path=None, random_opponents=False):
+
+def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.05, no_clear=False, export_dataset_path=None, policy_factory=None):
     wins = defaultdict(int)
     total_fan = defaultdict(int)
     draws = 0
     writer = None
     show_dataset_progress = bool(export_dataset_path) and n > 1
-    opponent_pool = _load_opponent_registry(opponent_registry_path)
     if export_dataset_path:
         writer = JsonlTrajectoryWriter(export_dataset_path)
         if show_dataset_progress:
@@ -479,12 +487,6 @@ def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.0
     try:
         for i in range(n):
             game_seed = None if seed is None else seed + i
-            policy_factory = None
-            if opponent_pool and random_opponents:
-                rng = random.Random(game_seed if game_seed is not None else i)
-                opponent_rows = _sample_opponent_rows(opponent_pool, 4, rng)
-                policy_factory = _build_policy_factory(opponent_rows)
-
             g = Game(quan=quan, seed=game_seed, dataset_writer=writer, game_id=f'game-{i}', policy_factory=policy_factory)
             result = g.run()
             if result['winner'] is None:
@@ -532,6 +534,8 @@ def run_games(n=1, quan=0, seed=None, show_turns=False, tui=False, tui_delay=0.0
             rate = wins[pid] / n * 100
             avg_fan = total_fan[pid] / wins[pid] if wins[pid] else 0
             print(f'  Player {pid}: {wins[pid]} wins ({rate:.1f}%)  avg_fan={avg_fan:.1f}')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Local Mahjong game simulator')
     parser.add_argument('--games', type=int, default=1, help='Number of games to simulate')
@@ -542,7 +546,5 @@ if __name__ == '__main__':
     parser.add_argument('--tui-delay', type=float, default=0.05, help='Seconds between TUI frames (default: 0.05)')
     parser.add_argument('--no-clear', action='store_true', help='Do not clear screen between TUI frames')
     parser.add_argument('--export-dataset', type=str, default=None, help='Optional path to write trajectory dataset JSONL.')
-    parser.add_argument('--opponent-registry', type=str, default=None, help='Path to opponents_registry.json to sample opponents from')
-    parser.add_argument('--random-opponents', action='store_true', help='Randomly sample all four seats from the opponent registry for each game')
     args = parser.parse_args()
-    run_games(n=args.games, quan=args.quan, seed=args.seed, show_turns=args.show_turns, tui=args.tui, tui_delay=args.tui_delay, no_clear=args.no_clear, export_dataset_path=args.export_dataset, opponent_registry_path=args.opponent_registry, random_opponents=args.random_opponents)
+    run_games(n=args.games, quan=args.quan, seed=args.seed, show_turns=args.show_turns, tui=args.tui, tui_delay=args.tui_delay, no_clear=args.no_clear, export_dataset_path=args.export_dataset)

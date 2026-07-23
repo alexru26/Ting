@@ -5,20 +5,41 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'src'))
+
 from dataset import JsonlTrajectoryReader, JsonlTrajectoryWriter, TrajectoryRecord
 
-class TestDatasetIO(unittest.TestCase):
 
-    def test_write_then_read_round_trip(self):
+class TestTrajectoryRoundtrip(unittest.TestCase):
+
+    def test_write_and_read_records(self):
+        record = TrajectoryRecord(
+            game_id='game-1',
+            turn_index=3,
+            player_id=2,
+            request_type=2,
+            request_action=None,
+            action='PLAY W1',
+            legal_actions=['PLAY W1', 'PLAY W2'],
+            reward=0.5,
+            done=True,
+            features={'schema_version': 4},
+            metadata={'note': 'test'},
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            dataset_path = os.path.join(tmp, 'sample.jsonl')
-            writer = JsonlTrajectoryWriter(dataset_path)
-            writer.write(TrajectoryRecord(game_id='g1', turn_index=0, player_id=0, request_type=2, request_action='DRAW', action='PLAY W1', legal_actions=['PASS', 'PLAY W1'], reward=0.0, done=False, features={'meta': [0]}))
-            writer.write(TrajectoryRecord(game_id='g1', turn_index=1, player_id=1, request_type=3, request_action='PLAY', action='PASS', legal_actions=['PASS', 'HU'], reward=0.5, done=True, features={'meta': [1]}))
-            writer.close()
-            records = list(JsonlTrajectoryReader(dataset_path))
-            self.assertEqual(len(records), 2)
-            self.assertEqual(records[0].action, 'PLAY W1')
-            self.assertEqual(records[1].done, True)
+            path = os.path.join(tmp, 'data.jsonl')
+            with JsonlTrajectoryWriter(path) as writer:
+                writer.write(record)
+                writer.write(record)
+            loaded = list(JsonlTrajectoryReader(path))
+        self.assertEqual(len(loaded), 2)
+        first = loaded[0]
+        self.assertEqual(first.game_id, 'game-1')
+        self.assertEqual(first.action, 'PLAY W1')
+        self.assertEqual(first.legal_actions, ['PLAY W1', 'PLAY W2'])
+        self.assertEqual(first.reward, 0.5)
+        self.assertTrue(first.done)
+        self.assertEqual(first.features['schema_version'], 4)
+
+
 if __name__ == '__main__':
     unittest.main()
