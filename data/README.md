@@ -5,7 +5,7 @@ sample.txt includes the first 16 game playing records, for the purpose of viewin
 Data format used for each round:
 1. Match ID on the first line, which can be viewed by opening the link https://botzone.org.cn/match/<ID> in web browsers. 
 2. Wind 0..3 on the second line, representing the round wind (0~3 represent east, north, west, and south).
-3. Player N Deal XX XX ...for the next four lines, representing the initial 13 tiles for four players. Note Player 0~3 representing the East, North, West, and South player specifically. All tiles can be represented using "capitalized letter+number", i.e. "W4" represents "Character-4", "B6" represents "Dot-6", "T8" represents "Bamboo-8", "F1"~"F4" represent "East, South, West, North Wind, "J1"~"J3" represent "Red Dragon, Green Dragon, White Dragon".
+3. Player N Deal XX XX ...for the next four lines, representing the initial 13 tiles for four players. Note Player 0-3 representing the East, North, West, and South player specifically. All tiles can be represented using "capitalized letter+number", i.e. "W4" represents "Character-4", "B6" represents "Dot-6", "T8" represents "Bamboo-8", "F1"-"F4" represent "East, South, West, North Wind, "J1"-"J3" represent "Red Dragon, Green Dragon, White Dragon".
 4. The next game playing rounds will have the following formats:
 
 - Player N Draw XX # player draws a tile, XX represents the tile
