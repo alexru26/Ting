@@ -6,8 +6,12 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 
+import random
+
 from model import CnnPolicyValueModel
 from rl_self_play import (
+    OpponentLeague,
+    backfill_decayed_returns,
     evaluate_against_baseline,
     promotion_gate,
     run_ppo_fine_tuning,
@@ -51,6 +55,48 @@ class TestPromotionGate(unittest.TestCase):
             'avg_score_delta': -5.0,
         }
         self.assertFalse(promotion_gate(evaluation))
+
+
+class TestFanBackwardCredit(unittest.TestCase):
+
+    def test_decayed_returns_and_advantages(self):
+        buffer = [{'value': 0.0} for _ in range(3)]
+        backfill_decayed_returns(buffer, episode_return=1.0, credit_gamma=0.5)
+        self.assertAlmostEqual(buffer[0]['return_target'], 0.25)
+        self.assertAlmostEqual(buffer[1]['return_target'], 0.5)
+        self.assertAlmostEqual(buffer[2]['return_target'], 1.0)
+        self.assertEqual(buffer[0]['win_target'], 1.0)
+        self.assertAlmostEqual(buffer[2]['advantage'], 1.0)
+
+    def test_losses_decay_toward_early_turns(self):
+        buffer = [{'value': 0.0} for _ in range(2)]
+        backfill_decayed_returns(buffer, episode_return=-0.8, credit_gamma=0.9)
+        self.assertAlmostEqual(buffer[0]['return_target'], -0.72)
+        self.assertEqual(buffer[0]['win_target'], 0.0)
+
+
+class TestOpponentLeague(unittest.TestCase):
+
+    def test_probabilities_zeroed_without_pools(self):
+        league = OpponentLeague(random.Random(1), finalist_models=[], historical_models=[], candidate_model=None)
+        kinds = {league.sample_seat()[0] for _ in range(20)}
+        self.assertEqual(kinds, {'rule'})
+
+    def test_sampling_covers_configured_pools(self):
+        league = OpponentLeague(
+            random.Random(2),
+            finalist_models=['finalist'],
+            historical_models=['hist'],
+            candidate_model='self',
+            finalist_prob=0.4,
+            historical_prob=0.3,
+            self_play_prob=0.2,
+        )
+        kinds = [league.sample_seat()[0] for _ in range(300)]
+        self.assertIn('finalist', kinds)
+        self.assertIn('historical', kinds)
+        self.assertIn('self', kinds)
+        self.assertIn('rule', kinds)
 
 
 class TestPpoPipeline(unittest.TestCase):

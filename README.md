@@ -22,12 +22,12 @@ A neural Chinese Standard Mahjong bot.
 In short: state reconstruction -> legal action enumeration -> feature
 extraction -> masked model scoring -> action string.
 
-## Model Input Contract (feature schema v4)
+## Model Input Contract (feature schema v5)
 
 Inputs are split into tile planes and a meta vector, defined in
 [src/features.py](src/features.py) and enforced at checkpoint load time:
 
-- Tile planes (18 x 34, all values on a lossless 0.25 grid):
+- Tile planes (21 x 34, supervised values on a lossless 0.25 grid):
   - 4 hand-count threshold planes (>=1, >=2, >=3, >=4 copies).
   - 1 own-meld plane and 3 opponent-meld planes (relative seat order),
     with melds expanded to per-tile counts (PENG=3, GANG=4, CHI=1 each).
@@ -35,6 +35,9 @@ Inputs are split into tile planes and a meta vector, defined in
   - 4 unseen-count threshold planes (remaining copies from our perspective).
   - 1 one-hot plane for the current event tile (drawn or claimed).
   - 1 plane marking tiles that reduce shanten (acceptance set).
+  - 3 oracle planes (opponent hands by relative seat): populated only during
+    oracle-guided RL in the simulator and annealed to zero (Suphx-style
+    curriculum); always zero in supervised data and at inference.
 - Meta vector (31 values): seat and prevalent-wind one-hots, decision phase
   (draw / discard-response / bugang-response), relative last actor, last
   request action, plus normalized scalars for flowers, meld count, game
@@ -53,7 +56,9 @@ per decision and duplicated what the value head should learn.
   processed by a Conv2d stem plus residual blocks, then fused with the meta
   vector into a shared hidden state.
 - Heads: action-family logits (PASS/HU/GANG/PLAY/BUGANG/PENG/CHI),
-  family-conditioned argument logits (2 x 35), and a scalar value head.
+  family-conditioned argument logits (2 x 35), a scalar value head, and an
+  auxiliary win head (predicts a positive-score outcome) that teaches the
+  trunk to separate strong actions from merely legal ones.
 - An action is scored as `family + arg1 + arg2` logits, and the policy is a
   softmax over the legal actions only. Training uses this same masked scoring,
   so the training objective matches the runtime decision rule exactly.
@@ -65,13 +70,22 @@ as attributes; loading verifies both strictly and raises on any mismatch.
 
 ## Training
 
-### 1. Data generation
+### 1. Training data
 
-Training data is generated locally by [src/local_game.py](src/local_game.py), which
-simulates full 4-player rounds with the rule-based teacher in
-[src/rule_policy.py](src/rule_policy.py) and exports JSONL trajectories through
-[src/dataset.py](src/dataset.py). Rewards are backfilled after each game as the
-final score delta (scaled by 1/64) so the value head has a real target:
+The primary supervised source is the Botzone match export in `data/data.txt`
+(98,209 real rounds; `data/sample.txt` is a 16-round preview).
+[src/botzone_ingest.py](src/botzone_ingest.py) replays every round, reconstructs
+each player's information state, and emits trajectory JSONL in the same
+schema as local self-play - including claim decisions, ignored HU/GANG
+declarations, per-player final-score rewards, and `steps_from_end` for
+credit decay:
+
+```bash
+python src/botzone_ingest.py --input data/data.txt --output data/botzone.jsonl --workers 12 --verbose
+```
+
+Local self-play data from the rule-based teacher remains available as a
+secondary source:
 
 ```bash
 python src/local_game.py --games 1000 --seed 1 --export-dataset data/local_data.jsonl
@@ -79,41 +93,55 @@ python src/local_game.py --games 1000 --seed 1 --export-dataset data/local_data.
 
 ### 2. Supervised training
 
-[src/imitation.py](src/imitation.py) trains from a compact pre-encoded cache that
-is built automatically (one streaming pass, quantized uint8 planes) when
-missing or stale:
+[src/imitation.py](src/imitation.py) trains from compact pre-encoded caches
+(auto-built, quantized uint8 planes). `--dataset` may be repeated with
+per-source weights to control the data mix; splits are by match so
+near-duplicate states never leak across train/validation:
 
 ```bash
-python src/imitation.py train-cnn --dataset data/local_data.jsonl --out src/model.h5 \
-    --epochs 20 --channels 64 --blocks 6 --hidden-size 512 --batch-size 1024 \
-    --device auto --verbose
+python src/imitation.py train-cnn \
+    --dataset data/botzone.jsonl:1.0 --dataset data/local_data.jsonl:0.3 \
+    --out src/model.h5 --epochs 20 --channels 64 --blocks 6 --hidden-size 512 \
+    --batch-size 1024 --device auto --verbose
 ```
 
-Training minimizes masked legal-action cross-entropy plus a value loss, with
-early stopping on validation masked cross-entropy. Forced turns contribute
-zero policy loss automatically (their legal softmax is a point mass), so no
-decision-only filtering is needed. Evaluate with:
+The objective is outcome-weighted masked legal-action cross-entropy
+(fan-backward credit via `--credit-gamma`, winning trajectories up-weighted
+via `--outcome-scale`, drawn games down-weighted via `--draw-weight`), plus
+a value loss on decayed returns and an auxiliary win-prediction loss
+(`--win-weight`). Forced turns contribute zero policy loss automatically.
+`eval-cnn` reports top-k masked accuracy, masked CE, value MSE, win-head
+accuracy, and ECE calibration, split by decision vs forced states:
 
 ```bash
-python src/imitation.py eval-cnn --dataset data/local_data.jsonl --model src/model.h5
+python src/imitation.py eval-cnn --dataset data/botzone.jsonl --model src/model.h5
 ```
 
 ### 3. Reinforcement learning and self-play
 
 [src/rl_self_play.py](src/rl_self_play.py) fine-tunes a checkpoint with batched
-PPO updates collected over whole games against the rule-based baseline and
-optional historical checkpoints:
+PPO updates against a sampled opponent league: the rule-based baseline, the
+27 frozen IJCAI finalist imitation checkpoints in `data/models/`
+(driven through [src/finalist_opponents.py](src/finalist_opponents.py); they are
+evaluation/league opponents, never training labels), historical h5
+checkpoints, and mirror copies of the current candidate:
 
 ```bash
 python src/rl_self_play.py ppo-train --model src/model.h5 --games 512 \
     --eval-games 64 --update-every 8 --device auto \
-    --opponents checkpoints/old_a.h5 checkpoints/old_b.h5
+    --finalist-dir data/models --finalist-prob 0.35 \
+    --league-dir checkpoints/league --self-play-prob 0.2 \
+    --oracle-start 0.7 --oracle-end 0.0 --credit-gamma 0.97
 ```
 
-`ppo-eval` measures a candidate greedily against rule-based baselines, and
-`duplicate-wall` plays candidate and baseline over identical walls for
-low-variance comparisons gated by SPRT
-([src/model_governance.py](src/model_governance.py)).
+Returns use Tjong-style fan-backward decay, advantages subtract the value
+head's prediction (Suphx-style learned baseline) and are normalized, and the
+oracle curriculum anneals perfect-information planes to zero over training.
+Promotion requires both the baseline gate and a paired duplicate-wall gate
+(SPRT + score-aware, [src/model_governance.py](src/model_governance.py));
+promoted candidates are snapshotted into `--league-dir` so later runs face
+them as opponents. `ppo-eval` and `duplicate-wall` remain available for
+standalone evaluation.
 
 ## Local Testing
 

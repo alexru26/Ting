@@ -1,19 +1,25 @@
 """PPO fine-tuning and evaluation for the Ting Mahjong policy.
 
 `ppo-train` fine-tunes a checkpoint with batched PPO updates collected over
-whole games against rule-based and optional historical neural opponents.
-`ppo-eval` measures a candidate greedily against rule-based baselines, and
-`duplicate-wall` runs paired same-wall comparisons for low-variance gating.
+whole games against a sampled opponent league (rule baseline, the frozen
+IJCAI finalist imitation checkpoints, historical h5 checkpoints, and mirror
+copies of the current candidate). Supports the Suphx-style oracle-feature
+curriculum and Tjong-style fan-backward credit decay. `ppo-eval` measures a
+candidate greedily against rule-based baselines, and `duplicate-wall` runs
+paired same-wall comparisons gated by SPRT.
 """
 
 import argparse
+import glob
 import json
+import os
 import random
 
 from local_game import Game, REWARD_SCALE
 from model import CnnPolicyValueModel
 from model_governance import duplicate_wall_evaluation, sprt_promotion_gate
 from features import FeatureExtractor
+from finalist_opponents import FinalistOpponentPolicy, load_finalist_models
 from rule_policy import GoalBasedPolicy
 
 
@@ -54,7 +60,11 @@ def shape_rewards(result, score_delta_weight=1.0, fan_weight=0.0, placement_weig
 
 
 class NeuralGreedyPolicy:
-    """Deterministic neural policy used for opponents and evaluation."""
+    """Deterministic neural policy used for opponents and evaluation.
+
+    Opponents never see oracle features: their checkpoints were trained with
+    zeroed oracle planes, so the curriculum applies to the candidate only.
+    """
 
     def __init__(self, state, model):
         self.state = state
@@ -62,6 +72,7 @@ class NeuralGreedyPolicy:
         self.feature_extractor = FeatureExtractor()
 
     def choose_action(self):
+        self.state.oracle_scale = 0.0
         legal_actions = self.state.enumerate_legal_actions()
         if not legal_actions:
             raise ValueError('No legal actions available')
@@ -109,6 +120,62 @@ def _build_opponent_models(opponent_paths, device='cpu'):
     return [CnnPolicyValueModel.load(path, device=device) for path in list(opponent_paths or [])]
 
 
+class OpponentLeague:
+    """Samples opponents per seat: finalists, historical checkpoints, a
+    frozen mirror of the current candidate, or the rule baseline."""
+
+    def __init__(self, rng, finalist_models=None, historical_models=None, candidate_model=None,
+                 finalist_prob=0.3, historical_prob=0.2, self_play_prob=0.2):
+        self.rng = rng
+        self.finalist_models = list(finalist_models or [])
+        self.historical_models = list(historical_models or [])
+        self.candidate_model = candidate_model
+        self.finalist_prob = float(finalist_prob) if self.finalist_models else 0.0
+        self.historical_prob = float(historical_prob) if self.historical_models else 0.0
+        self.self_play_prob = float(self_play_prob) if candidate_model is not None else 0.0
+
+    def sample_seat(self):
+        """Return (kind, model) for one opponent seat."""
+        roll = self.rng.random()
+        if roll < self.finalist_prob:
+            return 'finalist', self.rng.choice(self.finalist_models)
+        roll -= self.finalist_prob
+        if roll < self.historical_prob:
+            return 'historical', self.rng.choice(self.historical_models)
+        roll -= self.historical_prob
+        if roll < self.self_play_prob:
+            return 'self', self.candidate_model
+        return 'rule', None
+
+    def build_policy(self, state, kind, opponent_model):
+        if kind == 'finalist':
+            return FinalistOpponentPolicy(state, opponent_model)
+        if kind in ('historical', 'self'):
+            return NeuralGreedyPolicy(state, opponent_model)
+        return GoalBasedPolicy(state)
+
+
+def _collect_league_models(opponent_paths, league_dir, device):
+    paths = list(opponent_paths or [])
+    if league_dir and os.path.isdir(league_dir):
+        paths.extend(sorted(glob.glob(os.path.join(league_dir, '*.h5'))))
+    unique_paths = sorted(set(os.path.abspath(path) for path in paths))
+    return _build_opponent_models(unique_paths, device=device), unique_paths
+
+
+def backfill_decayed_returns(buffer, episode_return, credit_gamma):
+    """Tjong-style fan-backward credit: later decisions carry more of the
+    final outcome; every transition still gets a nonzero learning signal."""
+    total = len(buffer)
+    gamma = float(credit_gamma)
+    win_target = 1.0 if episode_return > 0.0 else 0.0
+    for position, transition in enumerate(buffer):
+        decayed = episode_return * (gamma ** (total - 1 - position))
+        transition['return_target'] = decayed
+        transition['advantage'] = decayed - float(transition['value'])
+        transition['win_target'] = win_target
+
+
 def run_ppo_fine_tuning(
     model_path,
     games=32,
@@ -121,6 +188,7 @@ def run_ppo_fine_tuning(
     clip_range=0.2,
     entropy_coef=0.01,
     value_coef=0.5,
+    win_coef=0.1,
     ppo_epochs=4,
     minibatch_size=256,
     update_every=8,
@@ -128,15 +196,36 @@ def run_ppo_fine_tuning(
     score_delta_weight=1.0,
     fan_weight=0.0,
     placement_weight=0.0,
+    credit_gamma=0.97,
+    oracle_start=0.0,
+    oracle_end=0.0,
+    finalist_dir=None,
+    finalist_limit=None,
+    finalist_prob=0.3,
+    historical_prob=0.2,
+    self_play_prob=0.2,
+    league_dir=None,
     game_factory=None,
     device='cpu',
     opponent_paths=None,
     out_path=None,
 ):
     model = CnnPolicyValueModel.load(model_path, device=device)
-    opponent_models = _build_opponent_models(opponent_paths, device=device)
+    historical_models, historical_paths = _collect_league_models(opponent_paths, league_dir, device)
+    finalist_models = []
+    if finalist_dir:
+        finalist_models = load_finalist_models(finalist_dir, device=device, limit=finalist_limit)
     game_factory = game_factory or Game
     rng = random.Random(int(seed))
+    league = OpponentLeague(
+        rng,
+        finalist_models=finalist_models,
+        historical_models=historical_models,
+        candidate_model=model,
+        finalist_prob=finalist_prob,
+        historical_prob=historical_prob,
+        self_play_prob=self_play_prob,
+    )
 
     summary = {
         'model_path': model_path,
@@ -149,6 +238,13 @@ def run_ppo_fine_tuning(
         'reward_total': 0.0,
         'wins': [0, 0, 0, 0],
         'draws': 0,
+        'league': {
+            'finalists': [m.name for m in finalist_models],
+            'historical': historical_paths,
+            'opponent_seats': {'finalist': 0, 'historical': 0, 'self': 0, 'rule': 0},
+        },
+        'oracle': {'start': float(oracle_start), 'end': float(oracle_end)},
+        'credit_gamma': float(credit_gamma),
     }
 
     total_episodes = max(0, int(games))
@@ -165,6 +261,7 @@ def run_ppo_fine_tuning(
             clip_range=clip_range,
             entropy_coef=entropy_coef,
             value_coef=value_coef,
+            win_coef=win_coef,
             epochs=ppo_epochs,
             minibatch_size=minibatch_size,
         )
@@ -176,22 +273,32 @@ def run_ppo_fine_tuning(
 
     for episode_index in range(total_episodes):
         buffer = []
-        seat_models = {}
+        seat_choices = {}
         for seat in range(4):
             if seat == int(candidate_seat):
                 continue
-            if opponent_models and rng.random() < 0.5:
-                seat_models[seat] = rng.choice(opponent_models)
+            kind, opponent_model = league.sample_seat()
+            seat_choices[seat] = (kind, opponent_model)
+            summary['league']['opponent_seats'][kind] += 1
+
+        if total_episodes > 1:
+            progress = episode_index / float(total_episodes - 1)
+        else:
+            progress = 1.0
+        oracle_scale = float(oracle_start) + (float(oracle_end) - float(oracle_start)) * progress
 
         def policy_factory(state):
             if state.my_id == int(candidate_seat):
                 return PpoPolicy(state, model, buffer=buffer, temperature=temperature)
-            opponent_model = seat_models.get(state.my_id)
-            if opponent_model is not None:
-                return NeuralGreedyPolicy(state, opponent_model)
-            return GoalBasedPolicy(state)
+            kind, opponent_model = seat_choices[state.my_id]
+            return league.build_policy(state, kind, opponent_model)
 
-        game = game_factory(quan=quan, seed=seed + episode_index, policy_factory=policy_factory)
+        game = game_factory(
+            quan=quan,
+            seed=seed + episode_index,
+            policy_factory=policy_factory,
+            oracle_scale=oracle_scale,
+        )
         result = game.run()
 
         winner = result.get('winner')
@@ -209,9 +316,7 @@ def run_ppo_fine_tuning(
         episode_return = float(rewards[int(candidate_seat)]) / REWARD_SCALE
         summary['reward_total'] += episode_return
 
-        for transition in buffer:
-            transition['return_target'] = episode_return
-            transition['advantage'] = episode_return - float(transition['value'])
+        backfill_decayed_returns(buffer, episode_return, credit_gamma)
         pending_transitions.extend(buffer)
 
         summary['episodes'] += 1
@@ -233,11 +338,33 @@ def run_ppo_fine_tuning(
         game_factory=game_factory,
         device=device,
     )
-    summary['promoted'] = promotion_gate(
-        summary['evaluation'],
-        min_win_rate=promote_min_win_rate,
-        min_avg_score_delta=promote_min_avg_score_delta,
+    summary['duplicate_wall'] = evaluate_duplicate_wall(
+        model_path=save_path,
+        games=max(2, int(eval_games) // 2),
+        seed=seed + 20000,
+        quan=quan,
+        candidate_seat=candidate_seat,
+        game_factory=game_factory,
+        device=device,
+        include_paired_results=False,
     )
+    # Promotion needs both the raw-baseline gate and the paired
+    # duplicate-wall gate (score-aware, low variance).
+    summary['promoted'] = bool(
+        promotion_gate(
+            summary['evaluation'],
+            min_win_rate=promote_min_win_rate,
+            min_avg_score_delta=promote_min_avg_score_delta,
+        )
+        and summary['duplicate_wall']['avg_score_delta'] >= float(promote_min_avg_score_delta)
+    )
+    if summary['promoted'] and league_dir:
+        os.makedirs(league_dir, exist_ok=True)
+        snapshot_path = os.path.join(
+            league_dir, 'league_seed%d_ep%d.h5' % (int(seed), int(summary['episodes']))
+        )
+        model.save(snapshot_path)
+        summary['league_snapshot'] = snapshot_path
     return summary
 
 
@@ -300,7 +427,7 @@ def promotion_gate(evaluation_summary, min_win_rate=0.55, min_avg_score_delta=0.
     return result.get('decision') == 'accept'
 
 
-def evaluate_duplicate_wall(model_path, games=16, seed=42, quan=0, candidate_seat=0, game_factory=None, device='cpu'):
+def evaluate_duplicate_wall(model_path, games=16, seed=42, quan=0, candidate_seat=0, game_factory=None, device='cpu', include_paired_results=True):
     model = CnnPolicyValueModel.load(model_path, device=device)
     game_factory = game_factory or Game
 
@@ -321,6 +448,8 @@ def evaluate_duplicate_wall(model_path, games=16, seed=42, quan=0, candidate_sea
         quan=quan,
         candidate_seat=candidate_seat,
     )
+    if not include_paired_results:
+        summary.pop('paired_results', None)
     summary['model_path'] = model_path
     summary['candidate_seat'] = int(candidate_seat)
     return summary
@@ -352,6 +481,16 @@ def main():
     ppo_train_parser.add_argument('--placement-weight', type=float, default=0.0, help='Reward weight for placement proxy')
     ppo_train_parser.add_argument('--device', default='cpu', help='Torch device: cpu, cuda, cuda:0, or auto')
     ppo_train_parser.add_argument('--opponents', nargs='*', default=[], help='Historical checkpoint paths used as neural opponents')
+    ppo_train_parser.add_argument('--win-coef', type=float, default=0.1, help='Auxiliary win-head loss coefficient')
+    ppo_train_parser.add_argument('--credit-gamma', type=float, default=0.97, help='Fan-backward credit decay per decision from episode end')
+    ppo_train_parser.add_argument('--oracle-start', type=float, default=0.0, help='Oracle plane scale at the first episode (Suphx-style curriculum)')
+    ppo_train_parser.add_argument('--oracle-end', type=float, default=0.0, help='Oracle plane scale at the last episode')
+    ppo_train_parser.add_argument('--finalist-dir', default=None, help='Directory of IJCAI finalist .pkl checkpoints (e.g. data/models)')
+    ppo_train_parser.add_argument('--finalist-limit', type=int, default=None, help='Load at most N finalist checkpoints')
+    ppo_train_parser.add_argument('--finalist-prob', type=float, default=0.3, help='Per-seat probability of a finalist opponent')
+    ppo_train_parser.add_argument('--historical-prob', type=float, default=0.2, help='Per-seat probability of a historical checkpoint opponent')
+    ppo_train_parser.add_argument('--self-play-prob', type=float, default=0.2, help='Per-seat probability of mirroring the current candidate')
+    ppo_train_parser.add_argument('--league-dir', default=None, help='Directory of league snapshots; promoted candidates are saved here')
 
     ppo_eval_parser = sub.add_parser('ppo-eval', help='Evaluate a candidate checkpoint against rule-based baselines')
     ppo_eval_parser.add_argument('--model', required=True, help='Model checkpoint path to evaluate')
@@ -384,6 +523,7 @@ def main():
             clip_range=args.clip_range,
             entropy_coef=args.entropy_coef,
             value_coef=args.value_coef,
+            win_coef=args.win_coef,
             ppo_epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             update_every=args.update_every,
@@ -391,6 +531,15 @@ def main():
             score_delta_weight=args.score_delta_weight,
             fan_weight=args.fan_weight,
             placement_weight=args.placement_weight,
+            credit_gamma=args.credit_gamma,
+            oracle_start=args.oracle_start,
+            oracle_end=args.oracle_end,
+            finalist_dir=args.finalist_dir,
+            finalist_limit=args.finalist_limit,
+            finalist_prob=args.finalist_prob,
+            historical_prob=args.historical_prob,
+            self_play_prob=args.self_play_prob,
+            league_dir=args.league_dir,
             device=args.device,
             opponent_paths=args.opponents,
             out_path=args.out,

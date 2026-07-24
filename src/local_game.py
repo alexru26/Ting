@@ -91,7 +91,7 @@ class _Player:
         self.discards = []
         self.flowers = []
 
-    def as_game_state(self, quan, all_players, last_tile, last_actor, last_action, last_discard, last_discard_player, request_type):
+    def as_game_state(self, quan, all_players, last_tile, last_actor, last_action, last_discard, last_discard_player, request_type, oracle_scale=0.0):
         gs = GameState()
         gs.my_id = self.pid
         gs.quan = quan
@@ -100,20 +100,28 @@ class _Player:
         gs.discards = self.discards[:]
         gs.flowers = len(self.flowers)
         for p in all_players:
-            if p.pid != self.pid:
-                gs.opponent_discards[p.pid] = p.discards[:]
-                gs.opponent_packs[p.pid] = p.packs[:]
-                for tile in p.discards:
-                    gs.seen_tiles[tile] += 1
-                for ptype, ptile, _ in p.packs:
-                    if ptype == 'PENG':
-                        gs.seen_tiles[ptile] += 3
-                    elif ptype == 'GANG':
-                        gs.seen_tiles[ptile] += 4
-                    elif ptype == 'CHI':
-                        mid_val = int(ptile[1:])
-                        for value in (mid_val - 1, mid_val, mid_val + 1):
-                            gs.seen_tiles[f'{ptile[0]}{value}'] += 1
+            if p.pid == self.pid:
+                continue
+            packs_visible = []
+            for ptype, ptile, poffer in p.packs:
+                if ptype == 'GANG' and poffer == p.pid:
+                    # Concealed kong: hidden from other players, exactly as at
+                    # runtime, and its tiles never enter their seen counts.
+                    packs_visible.append(('GANG', None, poffer))
+                    continue
+                packs_visible.append((ptype, ptile, poffer))
+                if ptype == 'PENG':
+                    gs.seen_tiles[ptile] += 3
+                elif ptype == 'GANG':
+                    gs.seen_tiles[ptile] += 4
+                elif ptype == 'CHI':
+                    mid_val = int(ptile[1:])
+                    for value in (mid_val - 1, mid_val, mid_val + 1):
+                        gs.seen_tiles[f'{ptile[0]}{value}'] += 1
+            gs.opponent_discards[p.pid] = p.discards[:]
+            gs.opponent_packs[p.pid] = packs_visible
+            for tile in p.discards:
+                gs.seen_tiles[tile] += 1
         for tile in self.discards:
             gs.seen_tiles[tile] += 1
         for ptype, ptile, _ in self.packs:
@@ -131,6 +139,11 @@ class _Player:
         gs.last_request_action = last_action
         gs._last_discard = last_discard
         gs._last_discard_player = last_discard_player
+        if oracle_scale and oracle_scale > 0.0:
+            gs.oracle_hands = {
+                (p.pid - self.pid) % 4: p.hand[:] for p in all_players if p.pid != self.pid
+            }
+            gs.oracle_scale = float(oracle_scale)
         return gs
 
     @property
@@ -154,8 +167,9 @@ class Game:
     """
     MIN_FAN = 8
 
-    def __init__(self, quan=0, seed=None, dataset_writer=None, game_id=None, policy_factory=None):
+    def __init__(self, quan=0, seed=None, dataset_writer=None, game_id=None, policy_factory=None, oracle_scale=0.0):
         self.quan = quan
+        self.oracle_scale = float(oracle_scale or 0.0)
         if seed is not None:
             random.seed(seed)
         self.wall = _build_wall()
@@ -231,15 +245,17 @@ class Game:
         self._decision_index += 1
 
     def _flush_trajectories(self):
-        """Backfill final rewards into buffered records, then write them."""
+        """Backfill final rewards and steps-from-end, then write records."""
         if self.dataset_writer is None:
             return
-        last_record_by_player = {}
+        per_player = {}
         for record in self._pending_records:
             record.reward = float(self.scores[record.player_id]) / REWARD_SCALE
-            last_record_by_player[record.player_id] = record
-        for record in last_record_by_player.values():
-            record.done = True
+            per_player.setdefault(record.player_id, []).append(record)
+        for rows in per_player.values():
+            for position, record in enumerate(rows):
+                record.metadata['steps_from_end'] = len(rows) - 1 - position
+            rows[-1].done = True
         for record in self._pending_records:
             self.dataset_writer.write(record)
         self._pending_records = []
@@ -273,7 +289,7 @@ class Game:
             if not tile:
                 return
         p.hand.append(tile)
-        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=pid, last_action='DRAW', last_discard=self._last_discard, last_discard_player=self._last_discard_player, request_type=2)
+        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=pid, last_action='DRAW', last_discard=self._last_discard, last_discard_player=self._last_discard_player, request_type=2, oracle_scale=self.oracle_scale)
         action = self._choose_policy_action(pid, gs)
         self._apply_draw_response(pid, tile, action)
         self._record_state(f'turn_end_p{pid}')
@@ -331,7 +347,7 @@ class Game:
             if not tile:
                 return
         p.hand.append(tile)
-        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=pid, last_action='DRAW', last_discard=self._last_discard, last_discard_player=self._last_discard_player, request_type=2)
+        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=pid, last_action='DRAW', last_discard=self._last_discard, last_discard_player=self._last_discard_player, request_type=2, oracle_scale=self.oracle_scale)
         action = self._choose_policy_action(pid, gs)
         self._apply_draw_response(pid, tile, action)
 
@@ -347,7 +363,7 @@ class Game:
             pid = (discard_player + offset) % 4
             p = self.players[pid]
             if p.hand.count(tile) >= 3:
-                gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=discard_player, last_action='PLAY', last_discard=tile, last_discard_player=discard_player, request_type=3)
+                gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=discard_player, last_action='PLAY', last_discard=tile, last_discard_player=discard_player, request_type=3, oracle_scale=self.oracle_scale)
                 resp = self._choose_policy_action(pid, gs)
                 if resp == 'GANG':
                     for _ in range(3):
@@ -360,7 +376,7 @@ class Game:
             pid = (discard_player + offset) % 4
             p = self.players[pid]
             if p.hand.count(tile) >= 2:
-                gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=discard_player, last_action='PLAY', last_discard=tile, last_discard_player=discard_player, request_type=3)
+                gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=discard_player, last_action='PLAY', last_discard=tile, last_discard_player=discard_player, request_type=3, oracle_scale=self.oracle_scale)
                 resp = self._choose_policy_action(pid, gs)
                 if resp.startswith('PENG'):
                     parts = resp.split()
@@ -380,7 +396,7 @@ class Game:
                         return
         chi_pid = (discard_player + 1) % 4
         p = self.players[chi_pid]
-        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=discard_player, last_action='PLAY', last_discard=tile, last_discard_player=discard_player, request_type=3)
+        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=discard_player, last_action='PLAY', last_discard=tile, last_discard_player=discard_player, request_type=3, oracle_scale=self.oracle_scale)
         resp = self._choose_policy_action(chi_pid, gs)
         if resp.startswith('CHI'):
             parts = resp.split()
@@ -408,7 +424,7 @@ class Game:
 
     def _claim_hu(self, pid, tile, from_player):
         p = self.players[pid]
-        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=from_player, last_action='PLAY', last_discard=tile, last_discard_player=from_player, request_type=3)
+        gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=from_player, last_action='PLAY', last_discard=tile, last_discard_player=from_player, request_type=3, oracle_scale=self.oracle_scale)
         resp = self._choose_policy_action(pid, gs)
         if resp == 'HU':
             if self._check_win(pid, tile, is_self_drawn=False, from_player=from_player):
@@ -422,7 +438,7 @@ class Game:
             if pid == gang_player:
                 continue
             p = self.players[pid]
-            gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=gang_player, last_action='BUGANG', last_discard=self._last_discard, last_discard_player=self._last_discard_player, request_type=3)
+            gs = p.as_game_state(self.quan, self.players, last_tile=tile, last_actor=gang_player, last_action='BUGANG', last_discard=self._last_discard, last_discard_player=self._last_discard_player, request_type=3, oracle_scale=self.oracle_scale)
             resp = self._choose_policy_action(pid, gs)
             if resp == 'HU':
                 if self._check_win(pid, tile, is_self_drawn=False, from_player=gang_player, is_about_kong=True):
