@@ -1,21 +1,24 @@
 """Deterministic state-to-feature conversion.
 
-Schema v4 contract (shared by runtime inference, dataset export, and the
+Schema v5 contract (shared by runtime inference, dataset export, and the
 training pipeline):
 
 - `tile_planes`: PLANE_COUNT x 34 grid of floats in [0, 1].
 - `meta`: flat vector of META_COUNT floats.
 
 The extractor is intentionally cheap: one fan calculation at most (for the
-can-win signal) plus shanten/acceptance analysis. The expensive
-fan-conditioned lookahead features from schema v3 were removed - they cost
-hundreds of fan-calculator calls per decision and duplicated what the value
-head should learn.
+can-win signal) plus cached shanten/acceptance analysis.
+
+The final three planes are oracle planes (opponent hand counts by relative
+seat). They are only populated during oracle-guided RL in the simulator -
+`state.oracle_hands` / `state.oracle_scale` - and are always zero at
+inference time and in supervised data, so the deployed policy never depends
+on information it will not have.
 """
 
 from tiles import ALL_TILES, TILE_TO_IDX, min_shanten, useful_tiles
 
-FEATURE_SCHEMA_VERSION = 4
+FEATURE_SCHEMA_VERSION = 5
 
 TILE_COUNT = len(ALL_TILES)
 
@@ -39,8 +42,12 @@ _PLANE_LAYOUT = (
     'unseen_ge4',
     'last_tile',
     'useful_tiles',
+    'oracle_opp1_hand',
+    'oracle_opp2_hand',
+    'oracle_opp3_hand',
 )
 PLANE_COUNT = len(_PLANE_LAYOUT)
+ORACLE_PLANE_COUNT = 3
 
 _LAST_ACTION_VOCAB = ('DRAW', 'PLAY', 'PENG', 'CHI', 'GANG', 'BUGANG')
 
@@ -135,6 +142,8 @@ class FeatureExtractor:
                 useful_plane[idx] = 1.0
         planes.append(useful_plane)
 
+        planes.extend(self._oracle_planes(state))
+
         meta = self._meta_vector(state, shanten, len(useful))
 
         return {
@@ -194,6 +203,26 @@ class FeatureExtractor:
             ]
         )
         return meta
+
+    @staticmethod
+    def _oracle_planes(state):
+        """Opponent hand-count planes, populated only during oracle-guided RL.
+
+        `state.oracle_hands` maps relative seat (1..3) to that opponent's
+        hidden hand; `state.oracle_scale` anneals the curriculum from 1 to 0.
+        Oracle features never enter the uint8 supervised cache (they are all
+        zero outside the RL simulator), so they may leave the 0.25 grid.
+        """
+        oracle_hands = getattr(state, 'oracle_hands', None)
+        scale = min(1.0, max(0.0, float(getattr(state, 'oracle_scale', 1.0) or 0.0)))
+        planes = []
+        for relative_seat in (1, 2, 3):
+            if not oracle_hands or scale <= 0.0:
+                planes.append([0.0] * TILE_COUNT)
+                continue
+            counts = _count_vector(oracle_hands.get(relative_seat, []))
+            planes.append([min(1.0, count / 4.0) * scale for count in counts])
+        return planes
 
     @staticmethod
     def _one_hot(index, size):

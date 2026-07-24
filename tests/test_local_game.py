@@ -55,14 +55,19 @@ class TestDatasetExport(unittest.TestCase):
 
         self.assertGreater(len(records), 0)
         done_players = set()
+        last_steps = {}
         for record in records:
             self.assertIn(record.action, record.legal_actions)
-            self.assertEqual(record.features['schema_version'], 4)
+            self.assertEqual(record.features['schema_version'], 5)
             expected_reward = float(result['scores'][record.player_id]) / REWARD_SCALE
             self.assertAlmostEqual(record.reward, expected_reward, places=9)
+            self.assertIn('steps_from_end', record.metadata)
+            last_steps[record.player_id] = record.metadata['steps_from_end']
             if record.done:
                 done_players.add(record.player_id)
         self.assertEqual(done_players, {r.player_id for r in records})
+        # The final record of every player is 0 steps from the end.
+        self.assertEqual(set(last_steps.values()), {0})
 
 
 if __name__ == '__main__':

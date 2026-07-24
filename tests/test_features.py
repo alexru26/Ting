@@ -99,6 +99,22 @@ class TestFeatureContract(unittest.TestCase):
         self.assertEqual(meta[5], 1.0)  # quan 1
         self.assertEqual(meta[8], 1.0)  # phase draw-decision
 
+    def test_oracle_planes_default_to_zero(self):
+        features = FeatureExtractor().extract(_basic_state())
+        for plane in features['tile_planes'][18:]:
+            self.assertEqual(sum(plane), 0.0)
+
+    def test_oracle_planes_populated_and_annealed(self):
+        state = _basic_state()
+        state.oracle_hands = {1: ['W9', 'W9'], 2: [], 3: []}
+        state.oracle_scale = 0.5
+        features = FeatureExtractor().extract(state)
+        oracle_plane = features['tile_planes'][18]
+        self.assertAlmostEqual(oracle_plane[TILE_TO_IDX['W9']], 0.5 * 0.5)
+        state.oracle_scale = 0.0
+        features = FeatureExtractor().extract(state)
+        self.assertEqual(sum(features['tile_planes'][18]), 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()

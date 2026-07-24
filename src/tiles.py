@@ -1,4 +1,5 @@
 from collections import Counter
+from functools import lru_cache
 
 
 NUMBERED_SUITS = ('W', 'B', 'T')
@@ -88,8 +89,13 @@ def _hand_to_counts(tiles):
 
 def shanten_standard(tiles, n_melded=0):
     """Standard 4-meld + 1-pair shanten. Returns -1 (win) to needed*2."""
+    return _shanten_standard_cached(tuple(_hand_to_counts(tiles)), int(n_melded))
+
+
+@lru_cache(maxsize=1 << 20)
+def _shanten_standard_cached(counts_key, n_melded):
     needed = 4 - n_melded
-    counts = _hand_to_counts(tiles)
+    counts = list(counts_key)
     best = [needed * 2]
 
     def update(mentsu, taatsu, jantai):
@@ -218,16 +224,71 @@ def best_discard(tiles, n_melded=0):
 def useful_tiles(tiles, n_melded=0):
     """Tiles that, if drawn, reduce shanten.
 
-    A 3n+2-tile hand's min_shanten equals the best over all discards of the
-    3n+1-tile shanten, so one shanten call per candidate suffices.
+    Cached on the hand shape, and decomposed by winning-hand type: a drawn
+    tile lowers min_shanten iff it lowers the shanten of a hand type that is
+    currently at the minimum. Seven-pairs and thirteen-orphans have closed
+    forms; only the standard form needs per-candidate evaluation, and only
+    for candidates adjacent to the hand (same tile, or within 2 in suit).
     """
-    current = min_shanten(tiles, n_melded)
+    return _useful_tiles_cached(tuple(_hand_to_counts(tiles)), int(n_melded))
+
+
+_ORPHAN_INDICES = tuple(
+    TILE_TO_IDX[t] for t in ('W1', 'W9', 'B1', 'B9', 'T1', 'T9', 'F1', 'F2', 'F3', 'F4', 'J1', 'J2', 'J3')
+)
+
+
+def _standard_candidate_indices(counts):
+    """Candidates that could extend a standard-form block."""
+    candidates = set()
+    for idx, count in enumerate(counts):
+        if count <= 0:
+            continue
+        if idx >= 27:
+            candidates.add(idx)
+            continue
+        suit_base = (idx // 9) * 9
+        suit_pos = idx % 9
+        for delta in (-2, -1, 0, 1, 2):
+            neighbor = suit_pos + delta
+            if 0 <= neighbor <= 8:
+                candidates.add(suit_base + neighbor)
+    return candidates
+
+
+@lru_cache(maxsize=1 << 18)
+def _useful_tiles_cached(counts_key, n_melded):
+    counts = list(counts_key)
+    tiles = [IDX_TO_TILE[idx] for idx, count in enumerate(counts) for _ in range(count)]
+
+    s_standard = shanten_standard(tiles, n_melded)
+    s_pairs = shanten_pairs(tiles)
+    s_orphans = shanten_orphans(tiles) if n_melded == 0 else 99
+    current = min(s_standard, s_pairs, s_orphans)
+
     result = set()
 
-    for candidate in ALL_TILES:
-        if tiles.count(candidate) >= 4:
-            continue
-        if min_shanten(tiles + [candidate], n_melded) < current:
-            result.add(candidate)
+    if s_pairs == current:
+        for idx, count in enumerate(counts):
+            if count == 1:
+                result.add(IDX_TO_TILE[idx])
 
-    return result
+    if s_orphans == current:
+        has_orphan_pair = any(counts[idx] >= 2 for idx in _ORPHAN_INDICES)
+        for idx in _ORPHAN_INDICES:
+            if counts[idx] == 0:
+                result.add(IDX_TO_TILE[idx])
+            elif counts[idx] == 1 and not has_orphan_pair:
+                result.add(IDX_TO_TILE[idx])
+
+    if s_standard == current:
+        for idx in _standard_candidate_indices(counts):
+            candidate = IDX_TO_TILE[idx]
+            if counts[idx] >= 4 or candidate in result:
+                continue
+            counts[idx] += 1
+            if _shanten_standard_cached(tuple(counts), n_melded) < s_standard:
+                result.add(candidate)
+            counts[idx] -= 1
+
+    return frozenset(result)

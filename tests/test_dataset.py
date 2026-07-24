@@ -22,7 +22,7 @@ class TestTrajectoryRoundtrip(unittest.TestCase):
             legal_actions=['PLAY W1', 'PLAY W2'],
             reward=0.5,
             done=True,
-            features={'schema_version': 4},
+            features={'schema_version': 5},
             metadata={'note': 'test'},
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -38,7 +38,7 @@ class TestTrajectoryRoundtrip(unittest.TestCase):
         self.assertEqual(first.legal_actions, ['PLAY W1', 'PLAY W2'])
         self.assertEqual(first.reward, 0.5)
         self.assertTrue(first.done)
-        self.assertEqual(first.features['schema_version'], 4)
+        self.assertEqual(first.features['schema_version'], 5)
 
 
 if __name__ == '__main__':

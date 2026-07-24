@@ -41,7 +41,7 @@ GRID_ROWS = 4
 GRID_COLS = 9
 GRID_CELLS = GRID_ROWS * GRID_COLS
 
-MODEL_TYPE = 'ting_cnn_v2'
+MODEL_TYPE = 'ting_cnn_v3'
 
 _FAMILY_INDEX = {label: idx for idx, label in enumerate(FAMILY_LABELS)}
 _ARG_INDEX = {label: idx for idx, label in enumerate(ARG_VOCAB)}
@@ -110,6 +110,9 @@ class CnnCore(nn.Module):
 
         self.value_hidden = nn.Linear(hidden_size, hidden_size // 2)
         self.value_head = nn.Linear(hidden_size // 2, 1)
+        # Auxiliary quality target: predicts whether this trajectory ends as a
+        # positive-score outcome, separating strong actions from merely legal ones.
+        self.win_head = nn.Linear(hidden_size // 2, 1)
 
     def forward(self, tile_planes, meta):
         batch_size = tile_planes.shape[0]
@@ -129,12 +132,14 @@ class CnnCore(nn.Module):
             [hidden.unsqueeze(1).expand(-1, family_count, -1), embeddings], dim=-1
         )
 
+        value_hidden = F.relu(self.value_hidden(hidden))
         return {
             'hidden': hidden,
             'family_logits': self.family_head(hidden),
             'arg1_all': self.arg1_head(conditioned),
             'arg2_all': self.arg2_head(conditioned),
-            'value': self.value_head(F.relu(self.value_hidden(hidden))),
+            'value': self.value_head(value_hidden),
+            'win_logit': self.win_head(value_hidden),
         }
 
 
@@ -324,7 +329,15 @@ class CnnPolicyValueModel:
         idx = np.asarray(indices, dtype=np.int64)
         # Planes are stored quantized (value * 4 as uint8, lossless for the
         # 0/0.25/0.5/0.75/1.0 grid) to keep caches 4x smaller than float32.
-        planes = self._to_device(preencoded['tile_planes_q'][idx].astype(np.float32) * 0.25)
+        planes_np = preencoded['tile_planes_q'][idx].astype(np.float32) * 0.25
+        if planes_np.shape[1] < PLANE_COUNT:
+            # Caches omit trailing oracle planes (always zero in supervised data).
+            pad = np.zeros(
+                (planes_np.shape[0], PLANE_COUNT - planes_np.shape[1], planes_np.shape[2]),
+                dtype=np.float32,
+            )
+            planes_np = np.concatenate([planes_np, pad], axis=1)
+        planes = self._to_device(planes_np)
         meta = self._to_device(preencoded['meta'][idx].astype(np.float32, copy=False))
         family = self._to_device(preencoded['legal_family'][idx].astype(np.int64, copy=False))
         arg1 = self._to_device(preencoded['legal_arg1'][idx].astype(np.int64, copy=False))
@@ -333,22 +346,46 @@ class CnnPolicyValueModel:
         width = family.shape[1]
         mask = self._to_device(np.arange(width)[None, :] < lengths[:, None])
         target = self._to_device(preencoded['target_index'][idx].astype(np.int64, copy=False))
-        reward = self._to_device(
-            preencoded['reward'][idx].astype(np.float32, copy=False)
-        ).unsqueeze(1)
-        return planes, meta, family, arg1, arg2, mask, target, reward, lengths
 
-    def train_preencoded_batch(self, preencoded, indices, policy_weight=1.0, value_weight=0.5):
-        planes, meta, family, arg1, arg2, mask, target, reward, lengths = self._preencoded_batch(
-            preencoded, indices
+        return_key = 'return_target' if 'return_target' in preencoded else 'reward'
+        returns = self._to_device(
+            preencoded[return_key][idx].astype(np.float32, copy=False)
+        ).unsqueeze(1)
+
+        if 'win_flag' in preencoded:
+            win_flags = preencoded['win_flag'][idx].astype(np.float32, copy=False)
+        else:
+            win_flags = (preencoded['reward'][idx] > 0.0).astype(np.float32)
+        win = self._to_device(win_flags).unsqueeze(1)
+
+        if 'sample_weight' in preencoded:
+            weights = self._to_device(
+                preencoded['sample_weight'][idx].astype(np.float32, copy=False)
+            )
+        else:
+            weights = torch.ones(len(idx), dtype=torch.float32, device=self.device)
+
+        return planes, meta, family, arg1, arg2, mask, target, returns, win, weights, lengths
+
+    def train_preencoded_batch(
+        self, preencoded, indices, policy_weight=1.0, value_weight=0.5, win_weight=0.2
+    ):
+        planes, meta, family, arg1, arg2, mask, target, returns, win, weights, lengths = (
+            self._preencoded_batch(preencoded, indices)
         )
         self.model.train()
         with self._autocast():
             outputs = self.model(planes, meta)
             scores = self._score_actions(outputs, family, arg1, arg2, mask)
-            policy_loss = F.cross_entropy(scores, target)
-            value_loss = F.mse_loss(outputs['value'], reward)
-            total_loss = float(policy_weight) * policy_loss + float(value_weight) * value_loss
+            per_sample = F.cross_entropy(scores, target, reduction='none')
+            policy_loss = (per_sample * weights).sum() / weights.sum().clamp(min=1e-8)
+            value_loss = F.mse_loss(outputs['value'], returns)
+            win_loss = F.binary_cross_entropy_with_logits(outputs['win_logit'], win)
+            total_loss = (
+                float(policy_weight) * policy_loss
+                + float(value_weight) * value_loss
+                + float(win_weight) * win_loss
+            )
 
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
@@ -365,6 +402,7 @@ class CnnPolicyValueModel:
             'samples': count,
             'policy_loss': float(policy_loss.item()) * count,
             'value_loss': float(value_loss.item()) * count,
+            'win_loss': float(win_loss.item()) * count,
             'action_hits': int(hits.sum().item()),
             'decision_samples': int(decision_mask.sum().item()),
             'decision_hits': decision_hits,
@@ -379,6 +417,7 @@ class CnnPolicyValueModel:
         sample_indices=None,
         policy_weight=1.0,
         value_weight=0.5,
+        win_weight=0.2,
         show_progress=False,
     ):
         total_all = int(len(preencoded['target_index']))
@@ -392,6 +431,7 @@ class CnnPolicyValueModel:
             'samples': 0,
             'policy_loss': 0.0,
             'value_loss': 0.0,
+            'win_loss': 0.0,
             'action_hits': 0,
             'decision_samples': 0,
             'decision_hits': 0,
@@ -409,7 +449,11 @@ class CnnPolicyValueModel:
             for start in range(0, total, batch_size):
                 batch = indices[start: start + batch_size]
                 result = self.train_preencoded_batch(
-                    preencoded, batch, policy_weight=policy_weight, value_weight=value_weight
+                    preencoded,
+                    batch,
+                    policy_weight=policy_weight,
+                    value_weight=value_weight,
+                    win_weight=win_weight,
                 )
                 for key in stats:
                     stats[key] += result[key]
@@ -418,7 +462,7 @@ class CnnPolicyValueModel:
                     _print_progress_bar(label, seen, total)
         return stats
 
-    def evaluate_preencoded(self, preencoded, sample_indices=None, batch_size=2048, top_ks=(1, 3)):
+    def evaluate_preencoded(self, preencoded, sample_indices=None, batch_size=2048, top_ks=(1, 3), ece_bins=10):
         total_all = int(len(preencoded['target_index']))
         indices = (
             np.arange(total_all, dtype=np.int64)
@@ -429,8 +473,11 @@ class CnnPolicyValueModel:
         metrics = {
             'evaluated': 0,
             'decision_evaluated': 0,
+            'forced_evaluated': 0,
             'masked_cross_entropy': 0.0,
             'value_mse': 0.0,
+            'win_accuracy': 0.0,
+            'ece': 0.0,
             'topk_accuracy': {str(k): 0.0 for k in top_ks},
         }
         if len(indices) <= 0:
@@ -438,40 +485,68 @@ class CnnPolicyValueModel:
 
         nll_sum = 0.0
         mse_sum = 0.0
+        win_hits = 0
         decision_count = 0
         hit_counts = {k: 0 for k in top_ks}
+        bin_confidence = np.zeros(int(ece_bins), dtype=np.float64)
+        bin_accuracy = np.zeros(int(ece_bins), dtype=np.float64)
+        bin_total = np.zeros(int(ece_bins), dtype=np.int64)
 
         self.model.eval()
         with torch.no_grad():
             for start in range(0, len(indices), max(1, int(batch_size))):
                 batch = indices[start: start + max(1, int(batch_size))]
-                planes, meta, family, arg1, arg2, mask, target, reward, lengths = (
+                planes, meta, family, arg1, arg2, mask, target, returns, win, _weights, lengths = (
                     self._preencoded_batch(preencoded, batch)
                 )
                 outputs = self.model(planes, meta)
                 scores = self._score_actions(outputs, family, arg1, arg2, mask)
                 log_probs = torch.log_softmax(scores, dim=1)
+                probs = torch.softmax(scores, dim=1)
                 target_log_probs = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
 
                 decision_rows = self._to_device(lengths > 1)
                 nll_sum += float((-target_log_probs * decision_rows).sum().item())
                 decision_count += int(decision_rows.sum().item())
-                mse_sum += float(F.mse_loss(outputs['value'], reward, reduction='sum').item())
+                mse_sum += float(F.mse_loss(outputs['value'], returns, reduction='sum').item())
+                win_pred = (outputs['win_logit'] > 0.0).to(torch.float32)
+                win_hits += int((win_pred == win).sum().item())
 
+                top1_prob, top1_index = probs.max(dim=1)
+                top1_correct = (top1_index == target).to(torch.float32)
                 ranked = torch.argsort(scores, dim=1, descending=True)
                 for k in top_ks:
                     in_top = (ranked[:, :k] == target.unsqueeze(1)).any(dim=1)
                     hit_counts[k] += int((in_top & decision_rows).sum().item())
 
+                # Calibration buckets over decision states only.
+                decision_np = decision_rows.cpu().numpy()
+                confidence_np = top1_prob.cpu().numpy()[decision_np]
+                correct_np = top1_correct.cpu().numpy()[decision_np]
+                bucket = np.minimum(
+                    (confidence_np * int(ece_bins)).astype(np.int64), int(ece_bins) - 1
+                )
+                np.add.at(bin_confidence, bucket, confidence_np)
+                np.add.at(bin_accuracy, bucket, correct_np)
+                np.add.at(bin_total, bucket, 1)
+
                 metrics['evaluated'] += int(len(batch))
 
         metrics['decision_evaluated'] = decision_count
+        metrics['forced_evaluated'] = metrics['evaluated'] - decision_count
         if decision_count > 0:
             metrics['masked_cross_entropy'] = nll_sum / float(decision_count)
             for k in top_ks:
                 metrics['topk_accuracy'][str(k)] = hit_counts[k] / float(decision_count)
+            occupied = bin_total > 0
+            gaps = np.abs(
+                bin_confidence[occupied] / bin_total[occupied]
+                - bin_accuracy[occupied] / bin_total[occupied]
+            )
+            metrics['ece'] = float((gaps * bin_total[occupied]).sum() / bin_total[occupied].sum())
         if metrics['evaluated'] > 0:
             metrics['value_mse'] = mse_sum / float(metrics['evaluated'])
+            metrics['win_accuracy'] = win_hits / float(metrics['evaluated'])
         return metrics
 
     # ------------------------------------------------------------------
@@ -484,13 +559,14 @@ class CnnPolicyValueModel:
         clip_range=0.2,
         entropy_coef=0.01,
         value_coef=0.5,
+        win_coef=0.1,
         epochs=4,
         minibatch_size=256,
     ):
         """Batched PPO update over a list of transition dicts.
 
         Each transition needs: features, legal_actions, action,
-        old_log_prob, advantage, return_target.
+        old_log_prob, advantage, return_target; optional win_target.
         """
         if not transitions:
             return {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
@@ -516,6 +592,13 @@ class CnnPolicyValueModel:
         return_np = np.array(
             [float(t['return_target']) for t in transitions], dtype=np.float32
         )
+        win_np = np.array(
+            [
+                float(t.get('win_target', 1.0 if float(t['return_target']) > 0.0 else 0.0))
+                for t in transitions
+            ],
+            dtype=np.float32,
+        )
 
         planes = self._to_device(planes_np)
         meta = self._to_device(meta_np)
@@ -527,6 +610,7 @@ class CnnPolicyValueModel:
         old_log_prob = self._to_device(old_log_prob_np)
         advantage = self._to_device(advantage_np)
         return_target = self._to_device(return_np).unsqueeze(1)
+        win_target = self._to_device(win_np).unsqueeze(1)
 
         total = len(transitions)
         stats = {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
@@ -558,9 +642,13 @@ class CnnPolicyValueModel:
                     # (rather than torch.where) keeps their gradients NaN-free.
                     entropy = -(probs * log_probs.clamp(min=-30.0)).sum(dim=1).mean()
                     value_loss = F.mse_loss(outputs['value'], return_target[rows])
+                    win_loss = F.binary_cross_entropy_with_logits(
+                        outputs['win_logit'], win_target[rows]
+                    )
                     loss = (
                         policy_loss
                         + float(value_coef) * value_loss
+                        + float(win_coef) * win_loss
                         - float(entropy_coef) * entropy
                     )
 

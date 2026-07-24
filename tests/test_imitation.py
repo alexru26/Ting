@@ -8,9 +8,21 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 
+import numpy as np
+
 from dataset import JsonlTrajectoryWriter, TrajectoryRecord
 from features import FeatureExtractor
-from imitation import default_cache_path, ensure_cache, evaluate_cnn, preencode_cnn, train_cnn
+from imitation import (
+    apply_training_signals,
+    default_cache_path,
+    ensure_cache,
+    evaluate_cnn,
+    merge_caches,
+    parse_dataset_spec,
+    preencode_cnn,
+    split_by_game,
+    train_cnn,
+)
 from model import CnnPolicyValueModel
 from state import GameState
 
@@ -21,7 +33,7 @@ _HANDS = [
 ]
 
 
-def _make_records(count=12):
+def _make_records(count=12, game_count=2):
     extractor = FeatureExtractor()
     records = []
     for index in range(count):
@@ -36,16 +48,17 @@ def _make_records(count=12):
         legal_actions = state.enumerate_legal_actions()
         records.append(
             TrajectoryRecord(
-                game_id='game-%d' % (index % 2),
+                game_id='game-%d' % (index % game_count),
                 turn_index=index,
                 player_id=state.my_id,
                 request_type=2,
                 request_action=None,
                 action=legal_actions[0],
                 legal_actions=legal_actions,
-                reward=0.1,
+                reward=0.1 if index % 2 == 0 else 0.0,
                 done=False,
                 features=extractor.extract(state),
+                metadata={'steps_from_end': count - 1 - index},
             )
         )
     return records
@@ -93,6 +106,50 @@ class TestPreencode(unittest.TestCase):
             payload = ensure_cache(dataset_path)
             self.assertEqual(len(payload['target_index']), 6)
             self.assertGreaterEqual(os.path.getmtime(cache_path), first_mtime)
+
+
+class TestTrainingSignals(unittest.TestCase):
+
+    def test_parse_dataset_spec(self):
+        self.assertEqual(parse_dataset_spec('data/a.jsonl'), ('data/a.jsonl', 1.0))
+        self.assertEqual(parse_dataset_spec('data/a.jsonl:2.5'), ('data/a.jsonl', 2.5))
+
+    def test_apply_training_signals_decay_and_weights(self):
+        preencoded = {
+            'reward': np.array([0.5, 0.5, 0.0], dtype=np.float32),
+            'steps_from_end': np.array([0, 2, 0], dtype=np.int16),
+        }
+        result = apply_training_signals(preencoded, credit_gamma=0.9, outcome_scale=1.0, draw_weight=0.5)
+        self.assertAlmostEqual(result['return_target'][0], 0.5, places=6)
+        self.assertAlmostEqual(result['return_target'][1], 0.5 * 0.81, places=6)
+        # Later winning decisions weigh more than early ones; draws are down-weighted.
+        self.assertGreater(result['sample_weight'][0], result['sample_weight'][1])
+        self.assertAlmostEqual(result['sample_weight'][2], 0.5, places=6)
+
+    def test_split_by_game_keeps_games_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_path = os.path.join(tmp, 'data.jsonl')
+            _write_dataset(dataset_path, _make_records(24, game_count=6))
+            payload = ensure_cache(dataset_path)
+            train_idx, val_idx = split_by_game(payload, train_ratio=0.75, seed=3)
+            self.assertGreater(len(train_idx), 0)
+            self.assertGreater(len(val_idx), 0)
+            train_games = set(payload['game_key'][train_idx].tolist())
+            val_games = set(payload['game_key'][val_idx].tolist())
+            self.assertEqual(train_games & val_games, set())
+
+    def test_merge_caches_mixes_sources_with_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path_a = os.path.join(tmp, 'a.jsonl')
+            path_b = os.path.join(tmp, 'b.jsonl')
+            _write_dataset(path_a, _make_records(4))
+            _write_dataset(path_b, _make_records(6))
+            merged = merge_caches(
+                [ensure_cache(path_a), ensure_cache(path_b)], [1.0, 3.0]
+            )
+            self.assertEqual(len(merged['target_index']), 10)
+            self.assertAlmostEqual(float(merged['source_weight'][0]), 1.0)
+            self.assertAlmostEqual(float(merged['source_weight'][-1]), 3.0)
 
 
 class TestTrainAndEvaluate(unittest.TestCase):
