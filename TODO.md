@@ -1,46 +1,45 @@
 # TODO
 
-All items from the previous TODO were addressed on the `rework` branch:
+## Training data
+- Ingest the Botzone-exported records in `data/` as a supervised training source, alongside the existing local self-play trajectories.
+- Normalize every record into the same trajectory schema used by the current imitation pipeline so Botzone logs, local games, and finalist logs can be mixed safely.
+- Split training and validation by match or replay seed, not by individual turn, to avoid leaking near-duplicate states across splits.
+- Add record filtering and weighting so the model does not learn all actions equally:
+	- down-weight forced or low-information turns,
+	- up-weight decisive turns near wins,
+	- up-weight trajectories with stronger final score or fan outcomes,
+	- keep a separate signal for good actions versus merely legal actions.
+- Treat the 27 fused Torch imitation checkpoints from the IJCAI 2026 Mahjong Competition as frozen evaluation opponents, not as training labels.
 
-1. **Remove the old rule-based fallback path** - DONE. The neural model is
-   the only runtime decision source ([src/policy.py](src/policy.py)); the rule
-   policy now lives in [src/rule_policy.py](src/rule_policy.py) and is used only
-   as the dataset-generation teacher and evaluation baseline. Set
-   `TING_LOG_DECISIONS=1` to log each decision's source (`model` vs `forced`
-   single-legal-action turns).
-2. **Rework the feature set** - DONE. Feature schema v4 (18 tile planes + 31
-   meta values, see README) replaces the fan-conditioned lookahead features;
-   the model input contract is enforced at checkpoint load.
-3. **Debug the invalid action at runtime** - DONE. Root causes were in
-   `enumerate_legal_actions`: PASS offered on draw turns, HU offered without a
-   winning hand, PENG/CHI discards that were consumed by the meld itself,
-   BUGANG without the fourth tile, and claims offered on our own discards.
-   All fixed with regression tests in [tests/test_state.py](tests/test_state.py).
-4. **Remove redundant and legacy code** - DONE. Deleted external ingestion,
-   package-profile layer, search planner, action codec, split manifests, and
-   the unusable `.pkl` opponent-registry path (those checkpoints came from a
-   different codebase and silently fell back to rule-based play).
-5. **Remove ml_packages.py** - DONE. Direct imports; missing dependencies
-   fail at import time.
-6. **Reduce fallback behavior** - DONE. Strict checkpoint loading (schema +
-   shape verified), no exception swallowing at runtime, deterministic greedy
-   action selection.
-7. **Optimize training** - DONE. Single-pass pre-encoding into a quantized
-   uint8 cache (auto-built/auto-refreshed), one batched training path with
-   masked legal-action cross-entropy, batched evaluation, batched PPO updates,
-   and dataset rewards backfilled from final scores (they were always 0
-   before, so the value head had no signal).
-8. **Consider multiple models per action** - DECIDED. One shared trunk with
-   family-conditioned argument heads scores each action family with its own
-   conditioned head while keeping the single checkpoint Botzone needs; see
-   README "Model Architecture".
+## Supervised learning
+- Extend imitation training to support weighted loss, so winning or high-scoring trajectories contribute more than low-value or noisy ones.
+- Add an auxiliary quality/value target so the model learns to distinguish strong actions from weak but legal actions.
+- Keep the current masked-action objective, but make the mask-aware weighting outcome-sensitive.
+- Add data-mix controls for Botzone logs, local self-play, and finalist corpora so the training recipe can be tuned instead of hard-coded.
+- Track separate metrics for decision states, forced states, top-k masked accuracy, and calibration.
 
-## Next steps
+## Reinforcement learning
+- Expand the opponent league to sample from:
+	- the rule-based baseline,
+	- the 27 external imitation-policy networks,
+	- previous RL checkpoints,
+	- the current candidate.
+- Keep previous checkpoints in the league even when a newer checkpoint becomes the active candidate.
+- Use historical checkpoints as training opponents so the policy does not overfit a single baseline style.
+- Make RL promotion depend on duplicate-wall evaluation and score-aware gates, not just raw win rate.
+- Continue shaping rewards with score delta, fan, and placement proxy, but keep the shaping explicit and tunable.
 
-- Regenerate a large dataset (`local_game.py --games 5000+`) and train the
-  full-size model on RunPod (`--channels 64 --blocks 6 --hidden-size 512`).
-- PPO league: keep promoted checkpoints and pass them via `--opponents` for
-  self-play diversity.
-- `data/models/*.pkl` and `data/opponents_registry.json` are legacy artifacts
-  from another codebase and are no longer referenced; delete them when
-  convenient.
+## Research notes to incorporate
+- Tjong paper: the "fan backward" idea propagates credit backward from a winning hand to the earlier actions that built it, instead of only rewarding the terminal win. This is useful for sparse Mahjong rewards because it gives earlier decisions nonzero learning signal.
+- Suphx: global reward prediction trains a baseline model to predict the final round or match outcome, then uses that prediction as a variance-reducing baseline in policy-gradient updates. This is standard actor-critic logic, but it is especially important in Mahjong because draw luck makes raw outcomes very noisy.
+- Suphx: oracle guiding trains with perfect-information features early in RL, then gradually masks those oracle features away so the policy learns from information it will actually have at inference time.
+- Use oracle-guided training as a curriculum: strong early gradient signal, then anneal toward deployable partial-information inputs.
+
+## Next implementation steps
+- Add a Botzone-log loader and a unified trajectory merger.
+- Add weighted imitation loss and a value-or-quality auxiliary head.
+- Add opponent sampling over finalist models and historical checkpoints.
+- Add a reward-backpropagation pass for fan-based credit assignment.
+- Add a global reward predictor baseline for PPO-style updates.
+- Add an oracle-feature masking curriculum for RL warm-starting.
+
