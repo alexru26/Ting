@@ -194,6 +194,12 @@ class CnnPolicyValueModel:
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = self.learning_rate
 
+    def reset_optimizer(self, learning_rate=None):
+        """Fresh Adam state; stale moments are wrong after restoring weights."""
+        if learning_rate is not None:
+            self.learning_rate = float(learning_rate)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
     def _autocast(self):
         if self.amp_enabled:
             return torch.autocast(device_type='cuda', dtype=torch.bfloat16)

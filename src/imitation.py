@@ -380,6 +380,26 @@ def train_cnn(
             )
         if val_metrics['decision_evaluated'] <= 0:
             continue
+        diverged = best_metric is not None and (
+            not np.isfinite(val_ce) or val_ce > best_metric * 1.5
+        )
+        if diverged and best_state is not None:
+            # Mid-epoch blow-ups leave the weights unusable; decaying the
+            # learning rate afterwards cannot undo that. Restore the best
+            # weights, drop stale Adam moments, and retry at half the rate.
+            model.load_state_dict(best_state)
+            model.reset_optimizer(model.learning_rate * 0.5)
+            without_improvement += 1
+            if verbose:
+                print(
+                    'validation diverged (%.4f > %.4f); restored best epoch %d, learning rate -> %.6g'
+                    % (val_ce, best_metric, best_epoch, model.learning_rate)
+                )
+            if patience > 0 and without_improvement >= patience:
+                if verbose:
+                    print('early stopping at epoch %d (best epoch %d)' % (epoch_idx + 1, best_epoch))
+                break
+            continue
         if best_metric is None or val_ce < best_metric:
             best_metric = val_ce
             best_epoch = epoch_idx + 1
