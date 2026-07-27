@@ -7,7 +7,12 @@ I zip up the following files: \_\_main\_\_.py, bot.py, policy.py, state.py, tile
 It seems that it cannot parse the path even though the zip contains model.h5. 
 
 ## Task 2
-Thoroughly research other prominent Mahjong ML models and consider how to improve the model. There is still a lot of room for improvement. Note that the current model.h5 in the repository is still considerably under the 4 mb limit. After the improvements, make sure everything works as expected. All changes should be in a new branch. Then, fully train a model from start to end through runpod. The command to ssh into the runpod is as follows:
+Read through the official documentation about Bots on Botzone: https://wiki.botzone.org.cn/index.php?title=Bot/en. Note that it specifies that you can upload data to a data path via "Manage Storage." You get around 268 MB of storage. In other words, it might be better to store the model into the data path. Look through the documentation for any other relevant information.
+
+## Task 3
+Double check the codebase to make sure it matches the game on Botzone: https://wiki.botzone.org.cn/index.php?title=Chinese-Standard-Mahjong/en.
+
+Then, thoroughly research other prominent Mahjong ML models and consider how to improve the model. There is still a lot of room for improvement. Note that the current model.h5 in the repository is still considerably under the 4 mb limit. After the improvements, make sure everything works as expected. All changes should be in a new branch. Then, fully train a model from start to end through runpod. The command to ssh into the runpod is as follows:
 
 ```bash
 ssh 8o5n5v7yas57ks-64411fe1@ssh.runpod.io -i ~/.ssh/id_ed25519
