@@ -149,7 +149,7 @@ rotating, which is the primary strength metric:
 
 ```bash
 python src/rl_self_play.py finalist-eval --model src/model.h5 \
-    --finalist-dir data/models --games 256 --device auto --verbose
+    --finalist-dir data/models --games 256 --verbose
 ```
 
 Returns use Tjong-style fan-backward decay, advantages subtract the value
