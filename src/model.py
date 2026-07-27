@@ -189,6 +189,11 @@ class CnnPolicyValueModel:
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
+    def set_learning_rate(self, learning_rate):
+        self.learning_rate = float(learning_rate)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.learning_rate
+
     def _autocast(self):
         if self.amp_enabled:
             return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
@@ -570,14 +575,21 @@ class CnnPolicyValueModel:
         win_coef=0.1,
         epochs=4,
         minibatch_size=256,
+        target_kl=None,
     ):
         """Batched PPO update over a list of transition dicts.
 
         Each transition needs: features, legal_actions, action,
         old_log_prob, advantage, return_target; optional win_target.
+        When `target_kl` is set, epochs stop early once the mean approximate
+        KL divergence from the behaviour policy exceeds it, which keeps the
+        fine-tuned policy from drifting far off the data it was collected on.
         """
         if not transitions:
-            return {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+            return {
+                'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0,
+                'entropy': 0.0, 'approx_kl': 0.0, 'kl_stopped': False,
+            }
 
         planes_np, meta_np = self.encode_features_batch(
             [t['features'] for t in transitions]
@@ -621,11 +633,18 @@ class CnnPolicyValueModel:
         win_target = self._to_device(win_np).unsqueeze(1)
 
         total = len(transitions)
-        stats = {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+        stats = {
+            'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0,
+            'entropy': 0.0, 'approx_kl': 0.0, 'kl_stopped': False,
+        }
         rng = np.random.default_rng(self.seed)
 
         self.model.train()
         for _epoch in range(max(1, int(epochs))):
+            if stats['kl_stopped']:
+                break
+            epoch_kl_sum = 0.0
+            epoch_kl_batches = 0
             order = np.arange(total)
             rng.shuffle(order)
             for start in range(0, total, max(1, int(minibatch_size))):
@@ -668,6 +687,16 @@ class CnnPolicyValueModel:
                 stats['policy_loss'] += float(policy_loss.item())
                 stats['value_loss'] += float(value_loss.item())
                 stats['entropy'] += float(entropy.item())
+
+                with torch.no_grad():
+                    batch_kl = float((old_log_prob[rows] - current_log_prob).mean().item())
+                epoch_kl_sum += batch_kl
+                epoch_kl_batches += 1
+                stats['approx_kl'] = batch_kl
+                if target_kl is not None and epoch_kl_batches > 0:
+                    if epoch_kl_sum / float(epoch_kl_batches) > float(target_kl):
+                        stats['kl_stopped'] = True
+                        break
 
         return stats
 

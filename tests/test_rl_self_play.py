@@ -13,6 +13,7 @@ from rl_self_play import (
     OpponentLeague,
     backfill_decayed_returns,
     evaluate_against_baseline,
+    evaluate_against_finalists,
     promotion_gate,
     run_ppo_fine_tuning,
     shape_rewards,
@@ -130,6 +131,47 @@ class TestPpoPipeline(unittest.TestCase):
             summary = evaluate_against_baseline(model_path=model_path, games=1, seed=21)
             self.assertEqual(summary['games'], 1)
             self.assertEqual(len(summary['mean_scores']), 4)
+
+    def test_ppo_train_learning_rate_and_kl_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, 'model.h5')
+            out_path = os.path.join(tmp, 'model_ppo.h5')
+            CnnPolicyValueModel(channels=8, blocks=1, hidden_size=32).save(model_path)
+            summary = run_ppo_fine_tuning(
+                model_path=model_path,
+                games=1,
+                eval_games=1,
+                seed=13,
+                update_every=1,
+                device='cpu',
+                out_path=out_path,
+                learning_rate=0.00005,
+                target_kl=0.02,
+                snapshot_every=1,
+            )
+            self.assertEqual(summary['learning_rate'], 0.00005)
+            self.assertEqual(summary['target_kl'], 0.02)
+            self.assertIn('kl_stops', summary)
+            self.assertTrue(os.path.exists(out_path + '.snapshot.h5'))
+
+    def test_evaluate_against_finalists_smoke(self):
+        finalist_dir = os.path.join(ROOT, 'data', 'models')
+        if not os.path.isdir(finalist_dir):
+            self.skipTest('finalist checkpoints not available')
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, 'model.h5')
+            CnnPolicyValueModel(channels=8, blocks=1, hidden_size=32).save(model_path)
+            summary = evaluate_against_finalists(
+                model_path=model_path,
+                finalist_dir=finalist_dir,
+                games=1,
+                seed=5,
+                finalist_limit=3,
+            )
+            self.assertEqual(summary['games'], 1)
+            self.assertEqual(len(summary['finalists']), 3)
+            total = summary['candidate_wins'] + summary['opponent_wins'] + summary['draws']
+            self.assertEqual(total, 1)
 
 
 if __name__ == '__main__':

@@ -135,7 +135,21 @@ python src/rl_self_play.py ppo-train --model src/model.h5 --games 512 \
     --eval-games 64 --update-every 8 --device auto \
     --finalist-dir data/models --finalist-prob 0.35 \
     --league-dir checkpoints/league --self-play-prob 0.2 \
-    --oracle-start 0.7 --oracle-end 0.0 --credit-gamma 0.97
+    --oracle-start 0.7 --oracle-end 0.0 --credit-gamma 0.97 \
+    --learning-rate 0.00003 --target-kl 0.02 --snapshot-every 200
+```
+
+PPO fine-tuning should use a much smaller learning rate than supervised
+training (`--learning-rate`, applied on top of the loaded checkpoint) and a
+KL guard (`--target-kl`) that stops update epochs early when the policy
+drifts too far from the data-collection policy; `--snapshot-every` writes a
+rolling `.snapshot.h5` so long runs are recoverable. `finalist-eval` plays
+the candidate against tables of three finalists with the candidate seat
+rotating, which is the primary strength metric:
+
+```bash
+python src/rl_self_play.py finalist-eval --model src/model.h5 \
+    --finalist-dir data/models --games 256 --device auto --verbose
 ```
 
 Returns use Tjong-style fan-backward decay, advantages subtract the value
