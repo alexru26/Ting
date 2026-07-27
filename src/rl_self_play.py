@@ -209,8 +209,13 @@ def run_ppo_fine_tuning(
     device='cpu',
     opponent_paths=None,
     out_path=None,
+    learning_rate=None,
+    target_kl=None,
+    snapshot_every=0,
 ):
     model = CnnPolicyValueModel.load(model_path, device=device)
+    if learning_rate is not None:
+        model.set_learning_rate(learning_rate)
     historical_models, historical_paths = _collect_league_models(opponent_paths, league_dir, device)
     finalist_models = []
     if finalist_dir:
@@ -245,6 +250,10 @@ def run_ppo_fine_tuning(
         },
         'oracle': {'start': float(oracle_start), 'end': float(oracle_end)},
         'credit_gamma': float(credit_gamma),
+        'learning_rate': float(model.learning_rate),
+        'target_kl': None if target_kl is None else float(target_kl),
+        'kl_stops': 0,
+        'last_approx_kl': 0.0,
     }
 
     total_episodes = max(0, int(games))
@@ -264,11 +273,15 @@ def run_ppo_fine_tuning(
             win_coef=win_coef,
             epochs=ppo_epochs,
             minibatch_size=minibatch_size,
+            target_kl=target_kl,
         )
         summary['updates'] += stats['updates']
         summary['policy_loss'] += stats['policy_loss']
         summary['value_loss'] += stats['value_loss']
         summary['entropy'] += stats['entropy']
+        summary['last_approx_kl'] = stats.get('approx_kl', 0.0)
+        if stats.get('kl_stopped'):
+            summary['kl_stops'] += 1
         pending_transitions.clear()
 
     for episode_index in range(total_episodes):
@@ -322,6 +335,10 @@ def run_ppo_fine_tuning(
         summary['episodes'] += 1
         if summary['episodes'] % max(1, int(update_every)) == 0:
             _flush_updates()
+        if int(snapshot_every) > 0 and summary['episodes'] % int(snapshot_every) == 0:
+            snapshot_target = (out_path or model_path) + '.snapshot.h5'
+            model.save(snapshot_target)
+            summary['last_snapshot'] = snapshot_target
         _print_progress_bar('ppo-train', summary['episodes'], total_episodes)
 
     _flush_updates()
@@ -416,6 +433,89 @@ def evaluate_against_baseline(model_path, games=16, seed=42, quan=0, candidate_s
     return summary
 
 
+def evaluate_against_finalists(
+    model_path,
+    finalist_dir,
+    games=64,
+    seed=42,
+    quan=0,
+    game_factory=None,
+    device='cpu',
+    finalist_limit=None,
+    show_progress=False,
+):
+    """Play the candidate against tables of frozen IJCAI finalists.
+
+    The candidate seat rotates every game and the three opponents are drawn
+    without replacement per game, so the summary reflects strength across
+    seats and across the whole finalist pool - the metric the Botzone ladder
+    actually rewards.
+    """
+    model = CnnPolicyValueModel.load(model_path, device=device)
+    finalist_models = load_finalist_models(finalist_dir, device=device, limit=finalist_limit)
+    if not finalist_models:
+        raise ValueError('No finalist checkpoints found in %r' % finalist_dir)
+    game_factory = game_factory or Game
+    rng = random.Random(int(seed))
+
+    summary = {
+        'model_path': model_path,
+        'games': 0,
+        'candidate_wins': 0,
+        'opponent_wins': 0,
+        'draws': 0,
+        'candidate_win_rate': 0.0,
+        'avg_candidate_score': 0.0,
+        'avg_score_delta': 0.0,
+        'finalists': [m.name for m in finalist_models],
+    }
+    score_sum = 0.0
+    delta_sum = 0.0
+
+    total_games = max(0, int(games))
+    for episode_index in range(total_games):
+        candidate_seat = episode_index % 4
+        opponents = rng.sample(finalist_models, 3)
+        seat_models = {}
+        opponent_index = 0
+        for seat in range(4):
+            if seat == candidate_seat:
+                continue
+            seat_models[seat] = opponents[opponent_index]
+            opponent_index += 1
+
+        def policy_factory(state):
+            if state.my_id == candidate_seat:
+                return NeuralGreedyPolicy(state, model)
+            return FinalistOpponentPolicy(state, seat_models[state.my_id])
+
+        game = game_factory(quan=quan, seed=seed + episode_index, policy_factory=policy_factory)
+        result = game.run()
+        summary['games'] += 1
+
+        winner = result.get('winner')
+        if winner is None:
+            summary['draws'] += 1
+        elif winner == candidate_seat:
+            summary['candidate_wins'] += 1
+        else:
+            summary['opponent_wins'] += 1
+
+        scores = list(result.get('scores', [0, 0, 0, 0]))
+        score_sum += float(scores[candidate_seat])
+        delta_sum += float(scores[candidate_seat]) - sum(
+            float(scores[pid]) for pid in range(4) if pid != candidate_seat
+        ) / 3.0
+        if show_progress:
+            _print_progress_bar('finalist-eval', summary['games'], total_games)
+
+    if summary['games'] > 0:
+        summary['candidate_win_rate'] = summary['candidate_wins'] / float(summary['games'])
+        summary['avg_candidate_score'] = score_sum / float(summary['games'])
+        summary['avg_score_delta'] = delta_sum / float(summary['games'])
+    return summary
+
+
 def promotion_gate(evaluation_summary, min_win_rate=0.55, min_avg_score_delta=0.0):
     if not evaluation_summary:
         return False
@@ -491,6 +591,19 @@ def main():
     ppo_train_parser.add_argument('--historical-prob', type=float, default=0.2, help='Per-seat probability of a historical checkpoint opponent')
     ppo_train_parser.add_argument('--self-play-prob', type=float, default=0.2, help='Per-seat probability of mirroring the current candidate')
     ppo_train_parser.add_argument('--league-dir', default=None, help='Directory of league snapshots; promoted candidates are saved here')
+    ppo_train_parser.add_argument('--learning-rate', type=float, default=None, help='Override the checkpoint learning rate for PPO (default: keep stored value)')
+    ppo_train_parser.add_argument('--target-kl', type=float, default=None, help='Stop PPO epochs early once mean approx KL exceeds this')
+    ppo_train_parser.add_argument('--snapshot-every', type=int, default=0, help='Save a .snapshot.h5 checkpoint every N games (0 disables)')
+
+    finalist_eval_parser = sub.add_parser('finalist-eval', help='Evaluate a candidate checkpoint against tables of finalist opponents')
+    finalist_eval_parser.add_argument('--model', required=True, help='Model checkpoint path to evaluate')
+    finalist_eval_parser.add_argument('--finalist-dir', required=True, help='Directory of IJCAI finalist .pkl checkpoints')
+    finalist_eval_parser.add_argument('--finalist-limit', type=int, default=None, help='Load at most N finalist checkpoints')
+    finalist_eval_parser.add_argument('--games', type=int, default=64, help='Evaluation games to run')
+    finalist_eval_parser.add_argument('--seed', type=int, default=42, help='Base random seed')
+    finalist_eval_parser.add_argument('--quan', type=int, default=0, help='Prevalent wind')
+    finalist_eval_parser.add_argument('--device', default='cpu', help='Torch device')
+    finalist_eval_parser.add_argument('--verbose', action='store_true', help='Print per-game progress')
 
     ppo_eval_parser = sub.add_parser('ppo-eval', help='Evaluate a candidate checkpoint against rule-based baselines')
     ppo_eval_parser.add_argument('--model', required=True, help='Model checkpoint path to evaluate')
@@ -543,6 +656,20 @@ def main():
             device=args.device,
             opponent_paths=args.opponents,
             out_path=args.out,
+            learning_rate=args.learning_rate,
+            target_kl=args.target_kl,
+            snapshot_every=args.snapshot_every,
+        )
+    elif args.command == 'finalist-eval':
+        summary = evaluate_against_finalists(
+            model_path=args.model,
+            finalist_dir=args.finalist_dir,
+            games=args.games,
+            seed=args.seed,
+            quan=args.quan,
+            device=args.device,
+            finalist_limit=args.finalist_limit,
+            show_progress=args.verbose,
         )
     elif args.command == 'ppo-eval':
         summary = evaluate_against_baseline(

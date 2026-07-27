@@ -277,6 +277,7 @@ def train_cnn(
     early_stopping_patience=3,
     batch_size=512,
     seed=7,
+    lr_decay_factor=0.5,
 ):
     train_start = time.perf_counter()
     if isinstance(dataset_specs, str):
@@ -379,6 +380,26 @@ def train_cnn(
             )
         if val_metrics['decision_evaluated'] <= 0:
             continue
+        diverged = best_metric is not None and (
+            not np.isfinite(val_ce) or val_ce > best_metric * 1.5
+        )
+        if diverged and best_state is not None:
+            # Mid-epoch blow-ups leave the weights unusable; decaying the
+            # learning rate afterwards cannot undo that. Restore the best
+            # weights, drop stale Adam moments, and retry at half the rate.
+            model.load_state_dict(best_state)
+            model.reset_optimizer(model.learning_rate * 0.5)
+            without_improvement += 1
+            if verbose:
+                print(
+                    'validation diverged (%.4f > %.4f); restored best epoch %d, learning rate -> %.6g'
+                    % (val_ce, best_metric, best_epoch, model.learning_rate)
+                )
+            if patience > 0 and without_improvement >= patience:
+                if verbose:
+                    print('early stopping at epoch %d (best epoch %d)' % (epoch_idx + 1, best_epoch))
+                break
+            continue
         if best_metric is None or val_ce < best_metric:
             best_metric = val_ce
             best_epoch = epoch_idx + 1
@@ -390,6 +411,12 @@ def train_cnn(
                 if verbose:
                     print('early stopping at epoch %d (best epoch %d)' % (epoch_idx + 1, best_epoch))
                 break
+            # Plateau: keep training but at a finer learning rate.
+            decay = float(lr_decay_factor)
+            if 0.0 < decay < 1.0:
+                model.set_learning_rate(model.learning_rate * decay)
+                if verbose:
+                    print('validation stalled; learning rate -> %.6g' % model.learning_rate)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -413,6 +440,7 @@ def train_cnn(
             'outcome_scale': float(outcome_scale),
             'draw_weight': float(draw_weight),
             'learning_rate': float(learning_rate),
+            'lr_decay_factor': float(lr_decay_factor),
             'seed': int(seed),
         }
     )
@@ -475,6 +503,7 @@ def _cmd_train_cnn(args):
         early_stopping_patience=args.early_stopping_patience,
         batch_size=args.batch_size,
         seed=args.seed,
+        lr_decay_factor=args.lr_decay_factor,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
@@ -520,6 +549,7 @@ def main():
     train_parser.add_argument('--outcome-scale', type=float, default=DEFAULT_OUTCOME_SCALE, help='Extra policy weight per unit of positive decayed return')
     train_parser.add_argument('--draw-weight', type=float, default=DEFAULT_DRAW_WEIGHT, help='Sample weight multiplier for drawn games')
     train_parser.add_argument('--early-stopping-patience', type=int, default=3, help='Stop when validation CE stalls for N epochs (0 disables)')
+    train_parser.add_argument('--lr-decay-factor', type=float, default=0.5, help='Multiply the learning rate by this on validation plateau (1.0 disables)')
     train_parser.add_argument('--device', default='auto', help='Torch device: cpu, cuda, cuda:0, or auto')
     train_parser.add_argument('--seed', type=int, default=7, help='Training seed')
     train_parser.add_argument('--verbose', action='store_true', help='Print per-epoch metrics')

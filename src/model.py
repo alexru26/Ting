@@ -43,6 +43,14 @@ GRID_CELLS = GRID_ROWS * GRID_COLS
 
 MODEL_TYPE = 'ting_cnn_v3'
 
+# Botzone rejects bot zips larger than 4 MB. The checkpoint must leave room
+# for the source files packed alongside it, so cap the model file itself.
+MODEL_FILE_BYTE_LIMIT = 3800000
+
+# Tensors at or above this element count are stored as per-channel int8;
+# smaller ones stay float16 where quantization noise is not worth the bytes.
+QUANTIZE_MIN_ELEMENTS = 256
+
 _FAMILY_INDEX = {label: idx for idx, label in enumerate(FAMILY_LABELS)}
 _ARG_INDEX = {label: idx for idx, label in enumerate(ARG_VOCAB)}
 _NONE_INDEX = _ARG_INDEX[NONE_TOKEN]
@@ -179,6 +187,17 @@ class CnnPolicyValueModel:
             blocks=self.blocks,
             hidden_size=self.hidden_size,
         ).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+
+    def set_learning_rate(self, learning_rate):
+        self.learning_rate = float(learning_rate)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.learning_rate
+
+    def reset_optimizer(self, learning_rate=None):
+        """Fresh Adam state; stale moments are wrong after restoring weights."""
+        if learning_rate is not None:
+            self.learning_rate = float(learning_rate)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
 
     def _autocast(self):
@@ -368,7 +387,8 @@ class CnnPolicyValueModel:
         return planes, meta, family, arg1, arg2, mask, target, returns, win, weights, lengths
 
     def train_preencoded_batch(
-        self, preencoded, indices, policy_weight=1.0, value_weight=0.5, win_weight=0.2
+        self, preencoded, indices, policy_weight=1.0, value_weight=0.5, win_weight=0.2,
+        max_grad_norm=1.0,
     ):
         planes, meta, family, arg1, arg2, mask, target, returns, win, weights, lengths = (
             self._preencoded_batch(preencoded, indices)
@@ -389,6 +409,8 @@ class CnnPolicyValueModel:
 
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        if max_grad_norm is not None and float(max_grad_norm) > 0.0:
+            nn.utils.clip_grad_norm_(self.model.parameters(), float(max_grad_norm))
         self.optimizer.step()
 
         with torch.no_grad():
@@ -419,6 +441,7 @@ class CnnPolicyValueModel:
         value_weight=0.5,
         win_weight=0.2,
         show_progress=False,
+        max_grad_norm=1.0,
     ):
         total_all = int(len(preencoded['target_index']))
         base_indices = (
@@ -454,6 +477,7 @@ class CnnPolicyValueModel:
                     policy_weight=policy_weight,
                     value_weight=value_weight,
                     win_weight=win_weight,
+                    max_grad_norm=max_grad_norm,
                 )
                 for key in stats:
                     stats[key] += result[key]
@@ -562,14 +586,22 @@ class CnnPolicyValueModel:
         win_coef=0.1,
         epochs=4,
         minibatch_size=256,
+        target_kl=None,
+        max_grad_norm=1.0,
     ):
         """Batched PPO update over a list of transition dicts.
 
         Each transition needs: features, legal_actions, action,
         old_log_prob, advantage, return_target; optional win_target.
+        When `target_kl` is set, epochs stop early once the mean approximate
+        KL divergence from the behaviour policy exceeds it, which keeps the
+        fine-tuned policy from drifting far off the data it was collected on.
         """
         if not transitions:
-            return {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+            return {
+                'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0,
+                'entropy': 0.0, 'approx_kl': 0.0, 'kl_stopped': False,
+            }
 
         planes_np, meta_np = self.encode_features_batch(
             [t['features'] for t in transitions]
@@ -613,11 +645,18 @@ class CnnPolicyValueModel:
         win_target = self._to_device(win_np).unsqueeze(1)
 
         total = len(transitions)
-        stats = {'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0}
+        stats = {
+            'updates': 0, 'policy_loss': 0.0, 'value_loss': 0.0,
+            'entropy': 0.0, 'approx_kl': 0.0, 'kl_stopped': False,
+        }
         rng = np.random.default_rng(self.seed)
 
         self.model.train()
         for _epoch in range(max(1, int(epochs))):
+            if stats['kl_stopped']:
+                break
+            epoch_kl_sum = 0.0
+            epoch_kl_batches = 0
             order = np.arange(total)
             rng.shuffle(order)
             for start in range(0, total, max(1, int(minibatch_size))):
@@ -654,12 +693,24 @@ class CnnPolicyValueModel:
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                if max_grad_norm is not None and float(max_grad_norm) > 0.0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), float(max_grad_norm))
                 self.optimizer.step()
 
                 stats['updates'] += 1
                 stats['policy_loss'] += float(policy_loss.item())
                 stats['value_loss'] += float(value_loss.item())
                 stats['entropy'] += float(entropy.item())
+
+                with torch.no_grad():
+                    batch_kl = float((old_log_prob[rows] - current_log_prob).mean().item())
+                epoch_kl_sum += batch_kl
+                epoch_kl_batches += 1
+                stats['approx_kl'] = batch_kl
+                if target_kl is not None and epoch_kl_batches > 0:
+                    if epoch_kl_sum / float(epoch_kl_batches) > float(target_kl):
+                        stats['kl_stopped'] = True
+                        break
 
         return stats
 
@@ -705,9 +756,28 @@ class CnnPolicyValueModel:
             handle.attrs['meta_count'] = META_COUNT
             handle.attrs['feature_schema_version'] = FEATURE_SCHEMA_VERSION
             handle.attrs['metadata'] = json.dumps(self.metadata, sort_keys=True)
+            handle.attrs['weights_format'] = 'int8_per_channel_v1'
             group = handle.create_group('state_dict')
             for key, tensor in self.state_dict().items():
-                group.create_dataset(key, data=tensor.numpy())
+                array = np.asarray(tensor.numpy(), dtype=np.float32)
+                if array.ndim >= 1 and array.size >= QUANTIZE_MIN_ELEMENTS:
+                    flat = array.reshape(array.shape[0], -1)
+                    scale = np.abs(flat).max(axis=1, keepdims=True) / 127.0
+                    scale[scale == 0.0] = 1.0
+                    quantized = np.round(flat / scale).astype(np.int8).reshape(array.shape)
+                    dataset = group.create_dataset(
+                        key, data=quantized, compression='gzip', compression_opts=4, shuffle=True
+                    )
+                    dataset.attrs['scale'] = scale.astype(np.float32).reshape(-1)
+                else:
+                    group.create_dataset(key, data=array.astype(np.float16))
+        size = os.path.getsize(path)
+        if size > MODEL_FILE_BYTE_LIMIT:
+            raise ValueError(
+                'Saved checkpoint is %d bytes, above the %d byte Botzone budget. '
+                'Shrink the architecture (channels/blocks/hidden_size).'
+                % (size, MODEL_FILE_BYTE_LIMIT)
+            )
 
     @classmethod
     def load(cls, path, device='cpu'):
@@ -740,6 +810,15 @@ class CnnPolicyValueModel:
                 metadata=json.loads(handle.attrs.get('metadata', '{}')),
                 device=device,
             )
-            state = {key: np.asarray(handle['state_dict'][key][()]) for key in handle['state_dict']}
+            group = handle['state_dict']
+            state = {}
+            for key in group:
+                dataset = group[key]
+                array = np.asarray(dataset[()])
+                if array.dtype == np.int8:
+                    scale = np.asarray(dataset.attrs['scale'], dtype=np.float32)
+                    flat = array.astype(np.float32).reshape(array.shape[0], -1)
+                    array = (flat * scale.reshape(-1, 1)).reshape(array.shape)
+                state[key] = array.astype(np.float32)
         model.load_state_dict(state)
         return model
