@@ -381,7 +381,8 @@ class CnnPolicyValueModel:
         return planes, meta, family, arg1, arg2, mask, target, returns, win, weights, lengths
 
     def train_preencoded_batch(
-        self, preencoded, indices, policy_weight=1.0, value_weight=0.5, win_weight=0.2
+        self, preencoded, indices, policy_weight=1.0, value_weight=0.5, win_weight=0.2,
+        max_grad_norm=1.0,
     ):
         planes, meta, family, arg1, arg2, mask, target, returns, win, weights, lengths = (
             self._preencoded_batch(preencoded, indices)
@@ -402,6 +403,8 @@ class CnnPolicyValueModel:
 
         self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        if max_grad_norm is not None and float(max_grad_norm) > 0.0:
+            nn.utils.clip_grad_norm_(self.model.parameters(), float(max_grad_norm))
         self.optimizer.step()
 
         with torch.no_grad():
@@ -432,6 +435,7 @@ class CnnPolicyValueModel:
         value_weight=0.5,
         win_weight=0.2,
         show_progress=False,
+        max_grad_norm=1.0,
     ):
         total_all = int(len(preencoded['target_index']))
         base_indices = (
@@ -467,6 +471,7 @@ class CnnPolicyValueModel:
                     policy_weight=policy_weight,
                     value_weight=value_weight,
                     win_weight=win_weight,
+                    max_grad_norm=max_grad_norm,
                 )
                 for key in stats:
                     stats[key] += result[key]
@@ -576,6 +581,7 @@ class CnnPolicyValueModel:
         epochs=4,
         minibatch_size=256,
         target_kl=None,
+        max_grad_norm=1.0,
     ):
         """Batched PPO update over a list of transition dicts.
 
@@ -681,6 +687,8 @@ class CnnPolicyValueModel:
 
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                if max_grad_norm is not None and float(max_grad_norm) > 0.0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), float(max_grad_norm))
                 self.optimizer.step()
 
                 stats['updates'] += 1
