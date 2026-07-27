@@ -43,6 +43,14 @@ GRID_CELLS = GRID_ROWS * GRID_COLS
 
 MODEL_TYPE = 'ting_cnn_v3'
 
+# Botzone rejects bot zips larger than 4 MB. The checkpoint must leave room
+# for the source files packed alongside it, so cap the model file itself.
+MODEL_FILE_BYTE_LIMIT = 3800000
+
+# Tensors at or above this element count are stored as per-channel int8;
+# smaller ones stay float16 where quantization noise is not worth the bytes.
+QUANTIZE_MIN_ELEMENTS = 256
+
 _FAMILY_INDEX = {label: idx for idx, label in enumerate(FAMILY_LABELS)}
 _ARG_INDEX = {label: idx for idx, label in enumerate(ARG_VOCAB)}
 _NONE_INDEX = _ARG_INDEX[NONE_TOKEN]
@@ -705,9 +713,28 @@ class CnnPolicyValueModel:
             handle.attrs['meta_count'] = META_COUNT
             handle.attrs['feature_schema_version'] = FEATURE_SCHEMA_VERSION
             handle.attrs['metadata'] = json.dumps(self.metadata, sort_keys=True)
+            handle.attrs['weights_format'] = 'int8_per_channel_v1'
             group = handle.create_group('state_dict')
             for key, tensor in self.state_dict().items():
-                group.create_dataset(key, data=tensor.numpy())
+                array = np.asarray(tensor.numpy(), dtype=np.float32)
+                if array.ndim >= 1 and array.size >= QUANTIZE_MIN_ELEMENTS:
+                    flat = array.reshape(array.shape[0], -1)
+                    scale = np.abs(flat).max(axis=1, keepdims=True) / 127.0
+                    scale[scale == 0.0] = 1.0
+                    quantized = np.round(flat / scale).astype(np.int8).reshape(array.shape)
+                    dataset = group.create_dataset(
+                        key, data=quantized, compression='gzip', compression_opts=4, shuffle=True
+                    )
+                    dataset.attrs['scale'] = scale.astype(np.float32).reshape(-1)
+                else:
+                    group.create_dataset(key, data=array.astype(np.float16))
+        size = os.path.getsize(path)
+        if size > MODEL_FILE_BYTE_LIMIT:
+            raise ValueError(
+                'Saved checkpoint is %d bytes, above the %d byte Botzone budget. '
+                'Shrink the architecture (channels/blocks/hidden_size).'
+                % (size, MODEL_FILE_BYTE_LIMIT)
+            )
 
     @classmethod
     def load(cls, path, device='cpu'):
@@ -740,6 +767,15 @@ class CnnPolicyValueModel:
                 metadata=json.loads(handle.attrs.get('metadata', '{}')),
                 device=device,
             )
-            state = {key: np.asarray(handle['state_dict'][key][()]) for key in handle['state_dict']}
+            group = handle['state_dict']
+            state = {}
+            for key in group:
+                dataset = group[key]
+                array = np.asarray(dataset[()])
+                if array.dtype == np.int8:
+                    scale = np.asarray(dataset.attrs['scale'], dtype=np.float32)
+                    flat = array.astype(np.float32).reshape(array.shape[0], -1)
+                    array = (flat * scale.reshape(-1, 1)).reshape(array.shape)
+                state[key] = array.astype(np.float32)
         model.load_state_dict(state)
         return model

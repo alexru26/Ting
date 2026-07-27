@@ -67,6 +67,10 @@ per decision and duplicated what the value head should learn.
 
 Checkpoints are HDF5 files with the architecture and feature contract stored
 as attributes; loading verifies both strictly and raises on any mismatch.
+Large weight tensors are stored as per-channel symmetric int8 (small ones as
+float16) and dequantized to float32 on load, keeping the file well under
+Botzone's 4 MB zip limit; `save()` raises if the file would exceed the
+`MODEL_FILE_BYTE_LIMIT` budget.
 
 ## Training
 
