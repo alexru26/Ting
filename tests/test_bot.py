@@ -73,7 +73,7 @@ class TestMahjongBot(unittest.TestCase):
         first = json.dumps(
             {'requests': ['0 0 0', _DEAL, '2 W4'], 'responses': ['PASS', 'PASS']}
         )
-        second = json.dumps('3 0 PLAY F1')
+        second = '3 0 PLAY F1'
         stdin = io.StringIO(first + '\n' + second + '\n')
         stdout = io.StringIO()
         old_stdin, old_stdout = sys.stdin, sys.stdout

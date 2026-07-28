@@ -9,8 +9,11 @@ class MahjongBot:
     """
     Botzone-compatible entry point.
 
-    Each turn Botzone sends one JSON object on stdin:
+    Traditional mode sends one JSON object on stdin:
         {"requests": [...all requests so far...], "responses": [...all previous responses...]}
+    Keep-running mode then sends only the current turn request on later turns
+    (often as a raw request line like "3 0 PLAY W1").
+
     The bot writes one JSON object to stdout:
         {"response": "<action>"}
 
@@ -54,7 +57,13 @@ class MahjongBot:
             line = line.strip()
             if not line:
                 continue
-            payload = json.loads(line)
+
+            # Keep-running mode may deliver raw request text instead of JSON.
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                payload = line
+
             if isinstance(payload, dict) and 'requests' in payload:
                 requests = list(payload['requests'])
                 responses = list(payload.get('responses', []))
