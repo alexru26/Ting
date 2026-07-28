@@ -12,10 +12,14 @@ Read through the official documentation about Bots on Botzone: https://wiki.botz
 ## Task 3
 Double check the codebase to make sure it matches the game on Botzone: https://wiki.botzone.org.cn/index.php?title=Chinese-Standard-Mahjong/en.
 
-Then, thoroughly research other prominent Mahjong ML models and consider how to improve the model. There is still a lot of room for improvement. Note that the current model.h5 in the repository is still considerably under the 4 mb limit. After the improvements, make sure everything works as expected. All changes should be in a new branch. Then, fully train a model from start to end through runpod. The command to ssh into the runpod is as follows:
+Then, thoroughly research other prominent Mahjong ML models and consider how to improve the model. There is still a lot of room for improvement. Note that the current model.h5 in the repository is still considerably under the 4 mb limit. After the improvements, make sure everything works as expected. All changes should be in a new branch. Then, fully train a model from start to end through runpod. Note that the pod id has changed, but all the persistent files are still there. The new command to ssh into the runpod is as follows:
 
 ```bash
-ssh 8o5n5v7yas57ks-64411fe1@ssh.runpod.io -i ~/.ssh/id_ed25519
+ssh 56c1vxudkuxjbo-64411b81@ssh.runpod.io -i ~/.ssh/id_ed25519
 ```
 
-When on the runpod, be wary of the fact that you might suddenly get disconnected from it. Do not stop to ask the user at any moment. Just continue to work through everything until you are done and you push all the changes onto github.
+When on the runpod, be wary of the fact that you might suddenly get disconnected from it. You can just reconnect immediately. Do not stop to ask the user at any moment. Just continue to work through everything until you are done and you push all the changes onto github. Finally, once you are done, close the runpod:
+
+```bash
+runpodctl stop pod 56c1vxudkuxjbo
+```
