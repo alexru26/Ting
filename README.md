@@ -118,8 +118,8 @@ near-duplicate states never leak across train/validation:
 ```bash
 python src/imitation.py train-cnn \
     --dataset data/botzone.jsonl:1.0 --dataset data/local_data.jsonl:0.3 \
-    --out src/model.h5 --epochs 20 --channels 64 --blocks 6 --hidden-size 512 \
-    --batch-size 1024 --device auto --verbose
+    --out src/model.h5 --epochs 16 --channels 128 --blocks 12 --hidden-size 512 \
+    --batch-size 1024 --learning-rate 0.0005 --device auto --verbose
 ```
 
 The objective is outcome-weighted masked legal-action cross-entropy
