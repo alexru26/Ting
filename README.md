@@ -2,6 +2,19 @@
 
 A neural Chinese Standard Mahjong bot.
 
+## Botzone Deployment
+
+- Zip only the Python sources (`__main__.py`, `bot.py`, `policy.py`,
+  `state.py`, `tiles.py`, `scoring.py`, `features.py`, `model.py`) and
+  upload that as the bot; keep it under the 4 MB zip limit.
+- Upload `model.h5` through Botzone's **Manage Storage** (~268 MB quota);
+  the bot finds it at the relative `data/model.h5` path first, then falls
+  back to a copy next to the sources (see `policy.candidate_model_paths`).
+- The bot answers in long-running mode (`>>>BOTZONE_REQUEST_KEEP_RUNNING<<<`),
+  so the torch import and checkpoint load happen once per game instead of
+  once per turn; it degrades transparently to the classic
+  restart-every-turn mode if the platform ignores the marker.
+
 ## Runtime Decision Flow
 
 1. [src/bot.py](src/bot.py) reads the JSON payload and rebuilds

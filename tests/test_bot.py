@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import sys
 import tempfile
@@ -66,6 +68,27 @@ class TestMahjongBot(unittest.TestCase):
         bot = MahjongBot()
         with self.assertRaises(ValueError):
             bot.handle_input({'requests': ['garbage'], 'responses': []})
+
+    def test_run_serves_full_history_then_incremental_lines(self):
+        first = json.dumps(
+            {'requests': ['0 0 0', _DEAL, '2 W4'], 'responses': ['PASS', 'PASS']}
+        )
+        second = json.dumps('3 0 PLAY F1')
+        stdin = io.StringIO(first + '\n' + second + '\n')
+        stdout = io.StringIO()
+        old_stdin, old_stdout = sys.stdin, sys.stdout
+        try:
+            sys.stdin, sys.stdout = stdin, stdout
+            MahjongBot().run()
+        finally:
+            sys.stdin, sys.stdout = old_stdin, old_stdout
+        lines = [line for line in stdout.getvalue().splitlines() if line]
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[1], '>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
+        self.assertEqual(lines[3], '>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
+        first_reply = json.loads(lines[0])
+        self.assertTrue(first_reply['response'].startswith('PLAY '))
+        self.assertEqual(json.loads(lines[2]), {'response': 'PASS'})
 
 
 if __name__ == '__main__':

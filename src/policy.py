@@ -6,8 +6,15 @@ propagates to the caller. Forced turns (exactly one legal action) are
 answered without touching the model, so every model call is a real
 decision.
 
+Checkpoint discovery order (first existing path wins):
+1. TING_POLICY_MODEL_PATH environment override.
+2. `data/model.h5` - Botzone "Manage Storage" uploads are exposed under
+   the relative `data` path, which sidesteps the 4 MB bot-zip budget.
+3. `model.h5` next to this file (repo layout / zip bundles that keep it).
+4. `model.h5` in the working directory.
+
 Environment overrides:
-- TING_POLICY_MODEL_PATH: checkpoint path (default: src/model.h5).
+- TING_POLICY_MODEL_PATH: checkpoint path.
 - TING_LOG_DECISIONS=1: log each decision and its source to stderr.
 """
 
@@ -22,13 +29,30 @@ _LOGGER = logging.getLogger(__name__)
 _MODEL_CACHE = {}
 
 
+def candidate_model_paths():
+    paths = []
+    override = os.getenv('TING_POLICY_MODEL_PATH')
+    if override:
+        paths.append(override)
+    paths.append(os.path.join('data', 'model.h5'))
+    paths.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model.h5'))
+    paths.append('model.h5')
+    return paths
+
+
 def default_model_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'model.h5')
+    candidates = candidate_model_paths()
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        'Model checkpoint not found; tried: %s' % ', '.join(candidates)
+    )
 
 
 def load_model(model_path=None, device='cpu'):
     """Load (and cache) the policy checkpoint. Raises if unavailable."""
-    path = model_path or os.getenv('TING_POLICY_MODEL_PATH') or default_model_path()
+    path = model_path or default_model_path()
     cache_key = (os.path.abspath(path), str(device))
     if cache_key not in _MODEL_CACHE:
         _MODEL_CACHE[cache_key] = CnnPolicyValueModel.load(path, device=device)

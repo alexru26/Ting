@@ -76,6 +76,22 @@ class TestNeuralPolicy(unittest.TestCase):
             action = policy.choose_action()
         self.assertIn(action, _draw_state().enumerate_legal_actions())
 
+    def test_default_model_path_prefers_botzone_data_dir(self):
+        from policy import default_model_path
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'data'))
+            data_path = os.path.join(tmp, 'data', 'model.h5')
+            CnnPolicyValueModel(channels=8, blocks=1, hidden_size=32).save(data_path)
+            old_cwd = os.getcwd()
+            old_env = os.environ.pop('TING_POLICY_MODEL_PATH', None)
+            try:
+                os.chdir(tmp)
+                self.assertEqual(default_model_path(), os.path.join('data', 'model.h5'))
+            finally:
+                os.chdir(old_cwd)
+                if old_env is not None:
+                    os.environ['TING_POLICY_MODEL_PATH'] = old_env
+
 
 if __name__ == '__main__':
     unittest.main()

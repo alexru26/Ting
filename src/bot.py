@@ -38,9 +38,34 @@ class MahjongBot:
         return policy.choose_action()
 
     def run(self):
-        payload = json.loads(sys.stdin.read())
-        response = self.handle_input(payload)
-        print(json.dumps({'response': response}))
+        """Serve turns in Botzone's long-running mode.
+
+        The first stdin line carries the full {"requests": [...],
+        "responses": [...]} history. After answering we emit the
+        KEEP_RUNNING marker so the process (torch import, loaded
+        checkpoint) survives; each later line then carries just that
+        turn's request. If the platform ignores the marker and restarts
+        the process instead, the loop simply sees a fresh full history
+        every time, so both modes work.
+        """
+        requests = []
+        responses = []
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if isinstance(payload, dict) and 'requests' in payload:
+                requests = list(payload['requests'])
+                responses = list(payload.get('responses', []))
+            else:
+                request = payload.get('request') if isinstance(payload, dict) else payload
+                requests.append(request)
+            response = self.handle_input({'requests': requests, 'responses': responses})
+            responses.append(response)
+            print(json.dumps({'response': response}))
+            print('>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
+            sys.stdout.flush()
 
 
 if __name__ == '__main__':
