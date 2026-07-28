@@ -43,9 +43,11 @@ GRID_CELLS = GRID_ROWS * GRID_COLS
 
 MODEL_TYPE = 'ting_cnn_v3'
 
-# Botzone rejects bot zips larger than 4 MB. The checkpoint must leave room
-# for the source files packed alongside it, so cap the model file itself.
-MODEL_FILE_BYTE_LIMIT = 3800000
+# The checkpoint ships via Botzone's "Manage Storage" data path (~268 MB
+# quota) rather than inside the 4 MB bot zip, so the real ceilings are the
+# sandbox's 256 MB RAM and per-turn CPU time. Cap the file well below the
+# quota; a checkpoint anywhere near this limit is a mistake.
+MODEL_FILE_BYTE_LIMIT = 200000000
 
 # Tensors at or above this element count are stored as per-channel int8;
 # smaller ones stay float16 where quantization noise is not worth the bytes.
