@@ -8,3 +8,4 @@ data/*.npz
 botzone
 ai
 runpod
+train
